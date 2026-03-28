@@ -27,7 +27,7 @@ public struct ZImageWeightsMapper {
   public func loadAll(dtype: DType? = .bfloat16) throws -> [String: MLXArray] {
     if hasQuantization() {
       logger.info("Detected quantized model, loading from quantized safetensors")
-      return try loadQuantizedAll()
+      return try loadQuantizedAll(dtype: dtype)
     }
     return try loadStandardAll(dtype: dtype)
   }
@@ -77,9 +77,11 @@ public struct ZImageWeightsMapper {
           }
         }
       }
-      return tensors
+      return ZImageVAEWeightAliases.normalized(tensors)
     }
-    return try loadStandardComponent(files: ZImageFiles.resolveVAEWeights(at: snapshot), dtype: dtype)
+    return ZImageVAEWeightAliases.normalized(
+      try loadStandardComponent(files: ZImageFiles.resolveVAEWeights(at: snapshot), dtype: dtype)
+    )
   }
 
   /// Load controlnet weights from a standalone safetensors file
@@ -160,13 +162,13 @@ public struct ZImageWeightsMapper {
   private func loadStandardAll(dtype: DType?) throws -> [String: MLXArray] {
     var tensors: [String: MLXArray] = [:]
 
-    for (key, value) in try loadStandardComponent(files: ZImageFiles.resolveTransformerWeights(at: snapshot), dtype: dtype) {
+    for (key, value) in try loadTransformer(dtype: dtype) {
       tensors["transformer.\(key)"] = value
     }
     for (key, value) in try loadTextEncoder(dtype: dtype) {
       tensors["text_encoder.\(key)"] = value
     }
-    for (key, value) in try loadStandardComponent(files: ZImageFiles.resolveVAEWeights(at: snapshot), dtype: dtype) {
+    for (key, value) in try loadVAE(dtype: dtype) {
       tensors["vae.\(key)"] = value
     }
 
@@ -177,16 +179,16 @@ public struct ZImageWeightsMapper {
     return tensors
   }
 
-  private func loadQuantizedAll() throws -> [String: MLXArray] {
+  private func loadQuantizedAll(dtype: DType?) throws -> [String: MLXArray] {
     var tensors: [String: MLXArray] = [:]
 
-    for (key, value) in try loadQuantizedComponent("transformer") {
+    for (key, value) in try loadTransformer(dtype: dtype) {
       tensors["transformer.\(key)"] = value
     }
-    for (key, value) in try loadQuantizedComponent("text_encoder") {
+    for (key, value) in try loadTextEncoder(dtype: dtype) {
       tensors["text_encoder.\(key)"] = value
     }
-    for (key, value) in try loadQuantizedComponent("vae") {
+    for (key, value) in try loadVAE(dtype: dtype) {
       tensors["vae.\(key)"] = value
     }
 
