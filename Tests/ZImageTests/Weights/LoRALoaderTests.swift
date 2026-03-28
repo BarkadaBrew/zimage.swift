@@ -77,6 +77,23 @@ final class LoRALoaderTests: XCTestCase {
     XCTAssertEqual(result, expected)
   }
 
+  func testMfluxCheckpointStyleKeysMapDirectly() {
+    let input = "diffusion_model.layers.12.feed_forward.w3"
+    let expected = "layers.12.feed_forward.w3.weight"
+
+    let result = LoRAKeyMapper.mapToZImageKey(input)
+    XCTAssertEqual(result, expected)
+  }
+
+  func testAdaLNTargetsAreRecognized() {
+    let input = "diffusion_model.layers.0.adaLN_modulation.0"
+    let expected = "layers.0.adaLN_modulation.0.weight"
+
+    let result = LoRAKeyMapper.mapToZImageKey(input)
+    XCTAssertEqual(result, expected)
+    XCTAssertTrue(LoRAKeyMapper.isValidTarget(expected))
+  }
+
   func testValidTargetPaths() {
     XCTAssertTrue(LoRAKeyMapper.isValidTarget("layers.0.attention.to_q.weight"))
     XCTAssertTrue(LoRAKeyMapper.isValidTarget("layers.0.feed_forward.w1.weight"))
@@ -117,6 +134,11 @@ final class LoRALoaderTests: XCTestCase {
   func testSupportedTargetPathsCount() {
 
     let paths = LoRAKeyMapper.supportedTargetPaths
-    XCTAssertEqual(paths.count, 238)
+    XCTAssertEqual(paths.count, 272)
+  }
+
+  func testLoRAConfigurationDoesNotClampScale() {
+    XCTAssertEqual(LoRAConfiguration.local("/tmp/test.safetensors", scale: -2).scale, -2)
+    XCTAssertEqual(LoRAConfiguration.local("/tmp/test.safetensors", scale: 1.5).scale, 1.5)
   }
 }

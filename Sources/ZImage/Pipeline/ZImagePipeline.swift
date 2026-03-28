@@ -17,9 +17,14 @@ public struct ZImageGenerationRequest: Sendable {
   public var seed: UInt64?
   public var outputPath: URL
   public var model: String?
+  public var textEncoderPath: String?
   public var maxSequenceLength: Int
 
-  public var lora: LoRAConfiguration?
+  public var loras: [LoRAConfiguration]
+  public var lora: LoRAConfiguration? {
+    get { loras.first }
+    set { loras = newValue.map { [$0] } ?? [] }
+  }
 
   public var enhancePrompt: Bool
 
@@ -36,8 +41,10 @@ public struct ZImageGenerationRequest: Sendable {
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "z-image.png"),
     model: String? = nil,
+    textEncoderPath: String? = nil,
     maxSequenceLength: Int = 512,
     lora: LoRAConfiguration? = nil,
+    loras: [LoRAConfiguration] = [],
     enhancePrompt: Bool = false,
     enhanceMaxTokens: Int = 512,
     forceTransformerOverrideOnly: Bool = false
@@ -51,14 +58,17 @@ public struct ZImageGenerationRequest: Sendable {
     self.seed = seed
     self.outputPath = outputPath
     self.model = model
+    self.textEncoderPath = textEncoderPath
     self.maxSequenceLength = maxSequenceLength
-    self.lora = lora
+    self.loras = loras.isEmpty ? (lora.map { [$0] } ?? []) : loras
     self.enhancePrompt = enhancePrompt
     self.enhanceMaxTokens = enhanceMaxTokens
     self.forceTransformerOverrideOnly = forceTransformerOverrideOnly
   }
 }
 
+// Pipeline instances cache mutable MLX state and are not thread-safe.
+// Callers should serialize access to a given pipeline instance.
 public final class ZImagePipeline {
   public enum PipelineError: Error, Sendable {
     case notImplemented
@@ -82,12 +92,19 @@ public final class ZImagePipeline {
   private var quantManifest: ZImageQuantizationManifest?
   private var isModelLoaded: Bool = false
   private var loadedModelId: String?
-  private var currentLoRA: LoRAWeights?
-  private var currentLoRAConfig: LoRAConfiguration?
   private var modelSnapshot: URL?
   private var useDynamicLoRA: Bool = false
   private var activeTransformerOverrideURL: URL?
   private var activeAIOCheckpointURL: URL?
+  private var loadedTextEncoderSelection: TextEncoderSelection?
+
+  // Stored behind pipeline-local serialized access only. LoRAWeights contains MLXArray.
+  private struct AppliedLoRA: @unchecked Sendable {
+    let weights: LoRAWeights
+    let configuration: LoRAConfiguration
+  }
+
+  private var currentLoRAs: [AppliedLoRA] = []
 
   public init(logger: Logger = Logger(label: "z-image.pipeline"), hubApi: HubApi = .shared) {
     self.logger = logger
@@ -106,37 +123,40 @@ public final class ZImagePipeline {
     isModelLoaded = false
     loadedModelId = nil
 
-    currentLoRA = nil
-    currentLoRAConfig = nil
+    currentLoRAs.removeAll()
     modelSnapshot = nil
     useDynamicLoRA = false
     activeTransformerOverrideURL = nil
     activeAIOCheckpointURL = nil
+    loadedTextEncoderSelection = nil
     GPU.clearCache()
     logger.info("Model unloaded from memory")
   }
 
   public func unloadLoRA() {
-    guard currentLoRA != nil else { return }
+    guard !currentLoRAs.isEmpty else { return }
 
     if let trans = transformer {
-      if let lora = currentLoRA, let config = currentLoRAConfig, lora.hasLoKr {
-        LoRAApplicator.removeLoKr(from: trans, loraWeights: lora, scale: config.scale, logger: logger)
+      for appliedLoRA in currentLoRAs where appliedLoRA.weights.hasLoKr {
+        LoRAApplicator.removeLoKr(
+          from: trans,
+          loraWeights: appliedLoRA.weights,
+          scale: appliedLoRA.configuration.scale,
+          logger: logger
+        )
       }
-
       LoRAApplicator.clearDynamicLoRA(from: trans, logger: logger)
     }
-    currentLoRA = nil
-    currentLoRAConfig = nil
+    let unloadedCount = currentLoRAs.count
+    currentLoRAs.removeAll()
     useDynamicLoRA = false
     GPU.clearCache()
-    logger.info("LoRA unloaded (instant)")
+    logger.info("LoRA unloaded (\(unloadedCount) adapter(s))")
   }
   public func unloadTransformer() {
     transformer = nil
 
-    currentLoRA = nil
-    currentLoRAConfig = nil
+    currentLoRAs.removeAll()
     useDynamicLoRA = false
     activeTransformerOverrideURL = nil
 
@@ -197,7 +217,7 @@ public final class ZImagePipeline {
     for (key, param) in params {
       guard var tensor = weights[key] else { continue }
       if transpose4DTensors && tensor.ndim == 4 {
-        tensor = tensor.transposed(0, 2, 3, 1)
+        tensor = ZImageWeightsMapping.alignTensorShape(tensor, to: param.shape)
       }
       if tensor.shape != param.shape {
         mismatches.append("\(key) expected \(param.shape) got \(tensor.shape)")
@@ -233,6 +253,7 @@ public final class ZImagePipeline {
       let result = try PipelineUtilities.encodePrompt(prompt, tokenizer: tokenizer, textEncoder: textEncoder, maxLength: maxLength)
       return (result.embeddings, result.mask)
     } catch {
+      logger.error("Prompt encoding failed: \(String(describing: error))")
       throw PipelineError.textEncoderNotLoaded
     }
   }
@@ -254,13 +275,7 @@ public final class ZImagePipeline {
         return resolveLocalSafetensors(candidateURL, forceTransformerOverrideOnly: forceTransformerOverrideOnly)
       }
       if isDir.boolValue {
-        let required = [
-          ZImageFiles.transformerConfig,
-          ZImageFiles.textEncoderConfig,
-          ZImageFiles.vaeConfig,
-        ]
-        let hasStructure = required.allSatisfy { FileManager.default.fileExists(atPath: candidateURL.appending(path: $0).path) }
-        if hasStructure {
+        if ZImageFiles.hasRecognizableModelDirectory(at: candidateURL) {
           return .init(baseModelSpec: modelSpec, transformerOverrideURL: nil, aioCheckpointURL: nil, aioTextEncoderPrefix: nil)
         }
 
@@ -307,7 +322,7 @@ public final class ZImagePipeline {
       }
     }
 
-    if let sourceDirectory {
+    if sourceDirectory != nil {
       logger.info("Using transformer override file from directory: \(url.lastPathComponent)")
     } else {
       logger.info("Using transformer override file: \(url.lastPathComponent)")
@@ -322,7 +337,7 @@ public final class ZImagePipeline {
 
     let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
     let baseTransformerWeights = try weightsMapper.loadTransformer()
-    ZImageWeightsMapping.applyTransformer(weights: baseTransformerWeights, to: transformer, manifest: nil, logger: logger)
+    try ZImageWeightsMapping.applyTransformer(weights: baseTransformerWeights, to: transformer, manifest: nil, logger: logger)
 
     activeTransformerOverrideURL = nil
 
@@ -335,10 +350,11 @@ public final class ZImagePipeline {
       }
 
       overrideWeights = canonicalizeTransformerOverride(overrideWeights, dim: configs.transformer.dim, logger: logger)
-      ZImageWeightsMapping.applyTransformer(weights: overrideWeights, to: transformer, manifest: nil, logger: logger)
+      try ZImageWeightsMapping.applyTransformer(weights: overrideWeights, to: transformer, manifest: nil, logger: logger)
       activeTransformerOverrideURL = overrideURL
     }
   }
+
   public struct GenerationProgress: Sendable {
     public let stage: Stage
     public let stepIndex: Int
@@ -368,6 +384,7 @@ public final class ZImagePipeline {
   public typealias ProgressHandler = (GenerationProgress) -> Void
   public func loadModel(
     modelSpec: String? = nil,
+    textEncoderPath: String? = nil,
     aioCheckpointURL: URL? = nil,
     aioTextEncoderPrefix: String? = nil,
     progressHandler: ProgressHandler? = nil
@@ -376,7 +393,39 @@ public final class ZImagePipeline {
     let normalizedAIOPath = aioCheckpointURL?.standardizedFileURL.path
     let currentAIOPath = activeAIOCheckpointURL?.standardizedFileURL.path
     let hasLoadedComponents = tokenizer != nil && textEncoder != nil && transformer != nil && vae != nil && modelConfigs != nil && modelSnapshot != nil
-    if isModelLoaded && loadedModelId == modelId && normalizedAIOPath == currentAIOPath && hasLoadedComponents {
+
+    if isModelLoaded,
+      loadedModelId == modelId,
+      normalizedAIOPath == currentAIOPath,
+      hasLoadedComponents,
+      let cachedSnapshot = modelSnapshot
+    {
+      let cachedSelection = PipelineUtilities.resolveTextEncoderSelection(
+        for: cachedSnapshot,
+        overridePath: textEncoderPath
+      )
+      if loadedTextEncoderSelection?.directory.standardizedFileURL.path == cachedSelection.directory.standardizedFileURL.path {
+        logger.info("Model already loaded, skipping load")
+        return
+      }
+    }
+
+    progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 0, totalSteps: 1))
+    let snapshotFilePatterns: [String]? = aioCheckpointURL == nil ? nil : PipelineSnapshot.configAndTokenizerFilePatterns
+    let snapshot = try await PipelineSnapshot.prepare(model: modelSpec, filePatterns: snapshotFilePatterns, logger: logger)
+    let textEncoderSelection = PipelineUtilities.resolveTextEncoderSelection(
+      for: snapshot,
+      overridePath: textEncoderPath,
+      logger: logger
+    )
+    let loadedTextEncoderPath = loadedTextEncoderSelection?.directory.standardizedFileURL.path
+    let selectedTextEncoderPath = textEncoderSelection.directory.standardizedFileURL.path
+    if isModelLoaded
+      && loadedModelId == modelId
+      && normalizedAIOPath == currentAIOPath
+      && loadedTextEncoderPath == selectedTextEncoderPath
+      && hasLoadedComponents
+    {
       logger.info("Model already loaded, skipping load")
       return
     }
@@ -392,8 +441,7 @@ public final class ZImagePipeline {
         textEncoder = nil
         transformer = nil
 
-        currentLoRA = nil
-        currentLoRAConfig = nil
+        currentLoRAs.removeAll()
         useDynamicLoRA = false
       } else {
         logger.info("Different model requested, unloading current model")
@@ -402,11 +450,7 @@ public final class ZImagePipeline {
     }
 
     logger.info("Loading model: \(modelId)")
-    progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 0, totalSteps: 1))
-
-    let snapshotFilePatterns: [String]? = aioCheckpointURL == nil ? nil : PipelineSnapshot.configAndTokenizerFilePatterns
-    let snapshot = try await PipelineSnapshot.prepare(model: modelSpec, filePatterns: snapshotFilePatterns, logger: logger)
-    let configs = try ZImageModelConfigs.load(from: snapshot)
+    let configs = try ZImageModelConfigs.load(from: snapshot, textEncoderDirectory: textEncoderSelection.directory)
     if tokenizer == nil {
       progressHandler?(GenerationProgress(stage: .encodingText, stepIndex: 0, totalSteps: 1))
       logger.info("Loading tokenizer...")
@@ -432,19 +476,19 @@ public final class ZImagePipeline {
 
       logger.info("Loading text encoder...")
       let te = try loadTextEncoder(snapshot: snapshot, config: configs.textEncoder)
-      ZImageWeightsMapping.applyTextEncoder(weights: aio.textEncoder, to: te, manifest: nil, logger: logger)
+      try ZImageWeightsMapping.applyTextEncoder(weights: aio.textEncoder, to: te, manifest: nil, logger: logger)
       textEncoder = te
 
       progressHandler?(GenerationProgress(stage: .loadingTransformer, stepIndex: 0, totalSteps: 1))
       logger.info("Loading transformer...")
       let trans = try loadTransformer(snapshot: snapshot, config: configs.transformer)
-      var transformerWeights = canonicalizeTransformerOverride(aio.transformer, dim: configs.transformer.dim, logger: logger)
+      let transformerWeights = canonicalizeTransformerOverride(aio.transformer, dim: configs.transformer.dim, logger: logger)
       if let inferredDim = inferTransformerDim(from: transformerWeights), inferredDim != configs.transformer.dim {
         throw PipelineError.weightsMissing("AIO transformer dim \(inferredDim) mismatches model dim \(configs.transformer.dim)")
       }
       try validateStrictAIOTransformerWeights(transformerWeights, config: configs.transformer)
       try validateAIOTransformerCoverage(transformerWeights, transformer: trans)
-      ZImageWeightsMapping.applyTransformer(weights: transformerWeights, to: trans, manifest: nil, logger: logger)
+      try ZImageWeightsMapping.applyTransformer(weights: transformerWeights, to: trans, manifest: nil, logger: logger)
       transformer = trans
 
       activeTransformerOverrideURL = nil
@@ -475,7 +519,7 @@ public final class ZImagePipeline {
         )
 
         if coverage >= minimumCoverage, mismatches.isEmpty {
-          ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: nil, logger: logger)
+          try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: nil, logger: logger)
         } else {
           let percent = Int((coverage * 100.0).rounded())
           if mismatches.isEmpty {
@@ -492,14 +536,18 @@ public final class ZImagePipeline {
           let weightsMapper = ZImageWeightsMapper(snapshot: baseVAESnapshot, logger: logger)
           let baseVAEWeights = try weightsMapper.loadVAE()
           let baseDecoderWeights = baseVAEWeights.filter { $0.key.hasPrefix("decoder.") }
-          ZImageWeightsMapping.applyVAE(weights: baseDecoderWeights, to: v, manifest: nil, logger: logger)
+          try ZImageWeightsMapping.applyVAE(weights: baseDecoderWeights, to: v, manifest: nil, logger: logger)
         }
         vae = v
       } else {
         logger.info("Reusing cached VAE")
       }
     } else {
-      let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
+      let weightsMapper = ZImageWeightsMapper(
+        snapshot: snapshot,
+        logger: logger,
+        textEncoderDirectory: textEncoderSelection.directory
+      )
       let manifest = weightsMapper.loadQuantizationManifest()
 
       if let m = manifest {
@@ -508,13 +556,13 @@ public final class ZImagePipeline {
       logger.info("Loading text encoder...")
       let te = try loadTextEncoder(snapshot: snapshot, config: configs.textEncoder)
       let textEncoderWeights = try weightsMapper.loadTextEncoder()
-      ZImageWeightsMapping.applyTextEncoder(weights: textEncoderWeights, to: te, manifest: manifest, logger: logger)
+      try ZImageWeightsMapping.applyTextEncoder(weights: textEncoderWeights, to: te, manifest: manifest, logger: logger)
       textEncoder = te
       progressHandler?(GenerationProgress(stage: .loadingTransformer, stepIndex: 0, totalSteps: 1))
       logger.info("Loading transformer...")
       let trans = try loadTransformer(snapshot: snapshot, config: configs.transformer)
       let transformerWeights = try weightsMapper.loadTransformer()
-      ZImageWeightsMapping.applyTransformer(weights: transformerWeights, to: trans, manifest: manifest, logger: logger)
+      try ZImageWeightsMapping.applyTransformer(weights: transformerWeights, to: trans, manifest: manifest, logger: logger)
       transformer = trans
       activeTransformerOverrideURL = nil
       activeAIOCheckpointURL = nil
@@ -524,7 +572,7 @@ public final class ZImagePipeline {
         let v = try loadVAEDecoder(snapshot: snapshot, config: configs.vae)
         let vaeWeights = try weightsMapper.loadVAE()
         let decoderWeights = vaeWeights.filter { $0.key.hasPrefix("decoder.") }
-        ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
+        try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
         vae = v
       } else {
         logger.info("Reusing cached VAE")
@@ -537,46 +585,59 @@ public final class ZImagePipeline {
     modelSnapshot = snapshot
     isModelLoaded = true
     loadedModelId = modelId
+    loadedTextEncoderSelection = textEncoderSelection
 
     logger.info("Model loaded successfully and cached in memory")
   }
   public func loadLoRA(_ config: LoRAConfiguration, progressHandler: ProgressHandler? = nil) async throws {
+    try await loadLoRAs([config], progressHandler: progressHandler)
+  }
+  public func loadLoRAs(_ configs: [LoRAConfiguration], progressHandler: ProgressHandler? = nil) async throws {
     guard let trans = transformer else {
       throw PipelineError.transformerNotLoaded
     }
-    if let currentConfig = currentLoRAConfig, currentConfig == config {
-      logger.info("LoRA already loaded with same configuration, skipping")
+    if currentLoRAs.map(\.configuration) == configs {
+      logger.info("LoRA stack already loaded with same configuration, skipping")
       return
     }
-    if currentLoRA != nil {
+    if !currentLoRAs.isEmpty {
       logger.info("Unloading previous LoRA...")
       unloadLoRA()
     }
+    guard !configs.isEmpty else { return }
 
     progressHandler?(GenerationProgress(stage: .loadingLoRA, stepIndex: 0, totalSteps: 1))
-    logger.info("Loading LoRA from \(config.source.displayName)...")
+    logger.info("Loading \(configs.count) LoRA(s)...")
 
     do {
+      currentLoRAs.removeAll(keepingCapacity: true)
+      for (index, config) in configs.enumerated() {
+        logger.info("Loading LoRA \(index + 1)/\(configs.count) from \(config.source.displayName)...")
+        let loraWeights = try await LoRAWeightLoader.load(from: config)
+        logger.info("Loaded LoRA: rank=\(loraWeights.rank), alpha=\(loraWeights.alpha), layers=\(loraWeights.layerCount)")
 
-      let loraWeights = try await LoRAWeightLoader.load(from: config)
-      logger.info("Loaded LoRA: rank=\(loraWeights.rank), alpha=\(loraWeights.alpha), layers=\(loraWeights.layerCount)")
-
-      useDynamicLoRA = true
-      LoRAApplicator.applyDynamically(to: trans, loraWeights: loraWeights, scale: config.scale, logger: logger)
-
-      currentLoRA = loraWeights
-      currentLoRAConfig = config
-
-      logger.info("LoRA applied successfully with scale=\(config.scale)")
+        useDynamicLoRA = true
+        LoRAApplicator.applyDynamically(to: trans, loraWeights: loraWeights, scale: config.scale, logger: logger)
+        currentLoRAs.append(AppliedLoRA(weights: loraWeights, configuration: config))
+        logger.info("LoRA applied successfully with scale=\(config.scale)")
+      }
+      logger.info("Applied \(currentLoRAs.count) LoRA(s) successfully")
     } catch let error as LoRAError {
+      unloadLoRA()
       throw PipelineError.loraError(error)
+    } catch {
+      unloadLoRA()
+      throw error
     }
   }
   public var hasLoRALoaded: Bool {
-    return currentLoRA != nil
+    return !currentLoRAs.isEmpty
   }
   public var loadedLoRAConfig: LoRAConfiguration? {
-    return currentLoRAConfig
+    return currentLoRAs.first?.configuration
+  }
+  public var loadedLoRAConfigs: [LoRAConfiguration] {
+    currentLoRAs.map(\.configuration)
   }
 
   public func generate(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> URL {
@@ -613,6 +674,7 @@ public final class ZImagePipeline {
     let selection = resolveModelSelection(request.model, forceTransformerOverrideOnly: request.forceTransformerOverrideOnly)
     try await loadModel(
       modelSpec: selection.baseModelSpec,
+      textEncoderPath: request.textEncoderPath,
       aioCheckpointURL: selection.aioCheckpointURL,
       aioTextEncoderPrefix: selection.aioTextEncoderPrefix,
       progressHandler: progressHandler
@@ -627,21 +689,19 @@ public final class ZImagePipeline {
       try applyTransformerOverrideIfNeeded(selection.transformerOverrideURL)
     }
 
-    if let loraConfig = request.lora {
-
-      if currentLoRAConfig != loraConfig {
-        try await loadLoRA(loraConfig, progressHandler: progressHandler)
+    if !request.loras.isEmpty {
+      if currentLoRAs.map(\.configuration) != request.loras {
+        try await loadLoRAs(request.loras, progressHandler: progressHandler)
       }
-    } else if currentLoRA != nil {
-
+    } else if !currentLoRAs.isEmpty {
       unloadLoRA()
     }
     progressHandler?(GenerationProgress(stage: .encodingText, stepIndex: 0, totalSteps: request.steps))
     logger.info("Encoding prompts...")
 
     let doCFG = request.guidanceScale > 1.0
-    let promptEmbeds: MLXArray
-    let negativeEmbeds: MLXArray?
+    var promptEmbeds: MLXArray
+    var negativeEmbeds: MLXArray?
     do {
       guard let tokenizer = tokenizer else {
         throw PipelineError.tokenizerNotLoaded
@@ -674,8 +734,14 @@ public final class ZImagePipeline {
 
       if doCFG {
         let (ne, _) = try encodePrompt(request.negativePrompt ?? "", tokenizer: tokenizer, textEncoder: textEncoder, maxLength: request.maxSequenceLength)
-        negativeEmbeds = ne
-        MLX.eval(promptEmbeds, ne)
+        let alignedEmbeddings = PipelineUtilities.alignNegativeEmbeddingsIfNeeded(
+          promptEmbeds: pe,
+          negativeEmbeds: ne
+        )
+        promptEmbeds = alignedEmbeddings.prompt
+
+        negativeEmbeds = alignedEmbeddings.negative
+        MLX.eval(promptEmbeds, alignedEmbeddings.negative)
       } else {
         negativeEmbeds = nil
         MLX.eval(promptEmbeds)

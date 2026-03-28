@@ -2,41 +2,52 @@ import Foundation
 import MLX
 import MLXNN
 
-public protocol DynamicLoRACapable: AnyObject {
+public struct LoRAAdapter {
+    public let down: MLXArray
+    public let up: MLXArray
+    public let scale: Float
 
-    var loraDown: MLXArray? { get set }
-    var loraUp: MLXArray? { get set }
-    var loraScale: Float { get set }
+    public init(down: MLXArray, up: MLXArray, scale: Float) {
+        self.down = down
+        self.up = up
+        self.scale = scale
+    }
+}
+
+public protocol DynamicLoRACapable: AnyObject {
+    var loraAdapters: [LoRAAdapter] { get set }
 }
 
 extension DynamicLoRACapable {
 
     public func setLoRA(down: MLXArray, up: MLXArray, scale: Float) {
-        self.loraDown = down
-        self.loraUp = up
-        self.loraScale = scale
+        self.loraAdapters = [LoRAAdapter(down: down, up: up, scale: scale)]
+    }
+    public func addLoRA(down: MLXArray, up: MLXArray, scale: Float) {
+        self.loraAdapters.append(LoRAAdapter(down: down, up: up, scale: scale))
     }
     public func clearLoRA() {
-        self.loraDown = nil
-        self.loraUp = nil
-        self.loraScale = 0.0
+        self.loraAdapters = []
     }
     public var hasLoRA: Bool {
-        loraDown != nil && loraUp != nil && loraScale > 0
+        loraAdapters.contains { $0.scale != 0 }
     }
     public func computeLoRAContribution(_ x: MLXArray) -> MLXArray? {
-        guard let down = loraDown, let up = loraUp, loraScale > 0 else {
+        let activeAdapters = loraAdapters.filter { $0.scale != 0 }
+        guard !activeAdapters.isEmpty else {
             return nil
         }
-        let loraHidden = MLX.matmul(x, down.T)
-        let loraOut = MLX.matmul(loraHidden, up.T)
-        return loraOut * loraScale
+        var total: MLXArray?
+        for adapter in activeAdapters {
+            let loraHidden = MLX.matmul(x, adapter.down.T)
+            let loraOut = MLX.matmul(loraHidden, adapter.up.T) * adapter.scale
+            total = total.map { $0 + loraOut } ?? loraOut
+        }
+        return total
     }
 }
 public class LoRALinear: Linear, DynamicLoRACapable {
-    public var loraDown: MLXArray?
-    public var loraUp: MLXArray?
-    public var loraScale: Float = 0.0
+    public var loraAdapters: [LoRAAdapter] = []
     public convenience init(from linear: Linear) {
         self.init(weight: linear.weight, bias: linear.bias)
     }
@@ -49,19 +60,15 @@ public class LoRALinear: Linear, DynamicLoRACapable {
         } else {
             result = MLX.matmul(x, weight.T)
         }
-        if let down = loraDown, let up = loraUp, loraScale > 0 {
-            let loraHidden = MLX.matmul(x, down.T)
-            let loraOut = MLX.matmul(loraHidden, up.T)
-            result = result + (loraOut * loraScale).asType(result.dtype)
+        if let loraContribution = computeLoRAContribution(x) {
+            result = result + loraContribution.asType(result.dtype)
         }
 
         return result
     }
 }
 public class LoRAQuantizedLinear: QuantizedLinear, DynamicLoRACapable {
-    public var loraDown: MLXArray?
-    public var loraUp: MLXArray?
-    public var loraScale: Float = 0.0
+    public var loraAdapters: [LoRAAdapter] = []
     public convenience init(from quantizedLinear: QuantizedLinear) {
         self.init(
             weight: quantizedLinear.weight,
@@ -88,11 +95,8 @@ public class LoRAQuantizedLinear: QuantizedLinear, DynamicLoRACapable {
         if let bias = bias {
             result = result + bias
         }
-        if let down = loraDown, let up = loraUp, loraScale > 0 {
-
-            let loraHidden = MLX.matmul(x, down.T)
-            let loraOut = MLX.matmul(loraHidden, up.T)
-            result = result + (loraOut * loraScale).asType(result.dtype)
+        if let loraContribution = computeLoRAContribution(x) {
+            result = result + loraContribution.asType(result.dtype)
         }
 
         return result

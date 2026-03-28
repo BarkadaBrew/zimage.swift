@@ -4,6 +4,17 @@ import MLX
 import MLXNN
 
 public struct ZImageWeightsMapping {
+  public enum WeightApplicationError: Error, LocalizedError {
+    case updateFailed(prefix: String, underlying: Error)
+
+    public var errorDescription: String? {
+      switch self {
+      case .updateFailed(let prefix, let underlying):
+        return "Failed to apply weights to \(prefix): \(underlying)"
+      }
+    }
+  }
+
   public struct Partition {
     public let transformer: [String: MLXArray]
     public let textEncoder: [String: MLXArray]
@@ -61,13 +72,21 @@ public struct ZImageWeightsMapping {
   private static func vaeMapping(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     var mapped: [String: MLXArray] = [:]
     for (k, v) in weights {
-      var tensor = v
-      if tensor.ndim == 4 {
-        tensor = tensor.transposed(0, 2, 3, 1)
-      }
-      mapped["vae.\(k)"] = tensor
+      mapped["vae.\(k)"] = v
     }
     return mapped
+  }
+
+  static func alignTensorShape(_ tensor: MLXArray, to expectedShape: [Int]) -> MLXArray {
+    guard tensor.shape != expectedShape else { return tensor }
+    guard needsTransposeToMatchShape(tensor.shape, expectedShape: expectedShape) else { return tensor }
+    return tensor.transposed(0, 2, 3, 1)
+  }
+
+  static func needsTransposeToMatchShape(_ tensorShape: [Int], expectedShape: [Int]) -> Bool {
+    guard tensorShape.count == 4, expectedShape.count == 4 else { return false }
+    guard tensorShape != expectedShape else { return false }
+    return [tensorShape[0], tensorShape[2], tensorShape[3], tensorShape[1]] == expectedShape
   }
 
   public static func applyTransformer(
@@ -75,7 +94,7 @@ public struct ZImageWeightsMapping {
     to model: ZImageTransformer2DModel,
     manifest: ZImageQuantizationManifest? = nil,
     logger: Logger
-  ) {
+  ) throws {
     if weights.isEmpty {
       logger.warning("Transformer weights empty; nothing to apply.")
       return
@@ -92,7 +111,7 @@ public struct ZImageWeightsMapping {
     }
 
     let mapped = transformerMapping(weights)
-    applyToModule(model, weights: mapped, prefix: "transformer", logger: logger)
+    try applyToModule(model, weights: mapped, prefix: "transformer", logger: logger)
 
     let groupSize = manifest?.groupSize ?? 32
     let bits = manifest?.bits ?? 8
@@ -108,7 +127,7 @@ public struct ZImageWeightsMapping {
     to model: QwenTextEncoder,
     manifest: ZImageQuantizationManifest? = nil,
     logger: Logger
-  ) {
+  ) throws {
     if weights.isEmpty {
       logger.warning("Text encoder weights empty; nothing to apply.")
       return
@@ -125,7 +144,7 @@ public struct ZImageWeightsMapping {
     }
 
     let mapped = textEncoderMapping(weights)
-    applyToModule(model, weights: mapped, prefix: "text_encoder", logger: logger)
+    try applyToModule(model, weights: mapped, prefix: "text_encoder", logger: logger)
   }
 
   public static func applyVAE(
@@ -133,24 +152,25 @@ public struct ZImageWeightsMapping {
     to model: Module,
     manifest: ZImageQuantizationManifest? = nil,
     logger: Logger
-  ) {
+  ) throws {
     if weights.isEmpty {
       logger.warning("VAE weights empty; nothing to apply.")
       return
     }
 
     let mapped = vaeMapping(weights)
-    applyToModule(model, weights: mapped, prefix: "vae", logger: logger)
+    try applyToModule(model, weights: mapped, prefix: "vae", logger: logger)
   }
 
-  private static func applyToModule(_ module: Module, weights: [String: MLXArray], prefix: String, logger: Logger) {
+  private static func applyToModule(_ module: Module, weights: [String: MLXArray], prefix: String, logger: Logger) throws {
     let params = module.parameters().flattened()
     var updates: [(String, MLXArray)] = []
 
-    for (key, _) in params {
+    for (key, param) in params {
       let candidates = [key, "\(prefix).\(key)"]
       if let found = candidates.compactMap({ weights[$0] }).first {
-        updates.append((key, found))
+        let aligned = alignTensorShape(found, to: param.shape)
+        updates.append((key, aligned))
       }
     }
 
@@ -177,6 +197,7 @@ public struct ZImageWeightsMapping {
       try module.update(parameters: nd, verify: [.shapeMismatch])
     } catch {
       logger.error("Failed to apply weights to \(prefix): \(error)")
+      throw WeightApplicationError.updateFailed(prefix: prefix, underlying: error)
     }
   }
 }

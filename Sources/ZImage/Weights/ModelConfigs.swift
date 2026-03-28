@@ -122,7 +122,7 @@ public struct ZImageModelConfigs {
   public let scheduler: ZImageSchedulerConfig
   public let textEncoder: ZImageTextEncoderConfig
 
-  public static func load(from snapshot: URL) throws -> ZImageModelConfigs {
+  public static func load(from snapshot: URL, textEncoderDirectory: URL? = nil) throws -> ZImageModelConfigs {
     let decoder = JSONDecoder()
     func loadJSON<T: Decodable>(_ relativePath: String, as type: T.Type) throws -> T {
       let url = snapshot.appending(path: relativePath)
@@ -130,10 +130,193 @@ public struct ZImageModelConfigs {
       return try decoder.decode(T.self, from: data)
     }
 
-    let transformer = try loadJSON(ZImageFiles.transformerConfig, as: ZImageTransformerConfig.self)
-    let vae = try loadJSON(ZImageFiles.vaeConfig, as: ZImageVAEConfig.self)
-    let scheduler = try loadJSON(ZImageFiles.schedulerConfig, as: ZImageSchedulerConfig.self)
-    let textEncoder = try loadJSON(ZImageFiles.textEncoderConfig, as: ZImageTextEncoderConfig.self)
+    let selectedTextEncoderDirectory = textEncoderDirectory
+      ?? ZImageFiles.resolveTextEncoderSelection(at: snapshot, overridePath: nil, environment: [:]).directory
+
+    let transformer: ZImageTransformerConfig
+    if FileManager.default.fileExists(atPath: snapshot.appending(path: ZImageFiles.transformerConfig).path) {
+      transformer = try loadJSON(ZImageFiles.transformerConfig, as: ZImageTransformerConfig.self)
+    } else {
+      transformer = try inferTransformerConfig(from: snapshot)
+    }
+
+    let vae: ZImageVAEConfig
+    if FileManager.default.fileExists(atPath: snapshot.appending(path: ZImageFiles.vaeConfig).path) {
+      vae = try loadJSON(ZImageFiles.vaeConfig, as: ZImageVAEConfig.self)
+    } else {
+      vae = try inferVAEConfig(from: snapshot)
+    }
+
+    let scheduler: ZImageSchedulerConfig
+    if FileManager.default.fileExists(atPath: snapshot.appending(path: ZImageFiles.schedulerConfig).path) {
+      scheduler = try loadJSON(ZImageFiles.schedulerConfig, as: ZImageSchedulerConfig.self)
+    } else {
+      scheduler = defaultSchedulerConfig
+    }
+
+    let textEncoderConfigURL = selectedTextEncoderDirectory.appendingPathComponent("config.json")
+    let textEncoder: ZImageTextEncoderConfig
+    if FileManager.default.fileExists(atPath: textEncoderConfigURL.path) {
+      let data = try Data(contentsOf: textEncoderConfigURL)
+      textEncoder = try decoder.decode(ZImageTextEncoderConfig.self, from: data)
+    } else {
+      textEncoder = try inferTextEncoderConfig(from: selectedTextEncoderDirectory)
+    }
+
     return ZImageModelConfigs(transformer: transformer, vae: vae, scheduler: scheduler, textEncoder: textEncoder)
+  }
+
+  static var defaultSchedulerConfig: ZImageSchedulerConfig {
+    ZImageSchedulerConfig(
+      numTrainTimesteps: 1000,
+      shift: 3.0,
+      useDynamicShifting: false,
+      baseShift: nil,
+      maxShift: nil,
+      baseImageSeqLen: nil,
+      maxImageSeqLen: nil
+    )
+  }
+
+  static var defaultVAEConfig: ZImageVAEConfig {
+    ZImageVAEConfig(
+      blockOutChannels: [128, 256, 512, 512],
+      latentChannels: 16,
+      scalingFactor: 0.3611,
+      shiftFactor: 0.1159,
+      sampleSize: 1024,
+      inChannels: 3,
+      outChannels: 3,
+      layersPerBlock: 2,
+      normNumGroups: 32,
+      midBlockAddAttention: true,
+      usePostQuantConv: false,
+      useQuantConv: false
+    )
+  }
+
+  static func inferTransformerConfig(from snapshot: URL) throws -> ZImageTransformerConfig {
+    let shapes = try loadTensorShapes(from: ZImageFiles.resolveWeightFiles(in: snapshot.appendingPathComponent("transformer"), componentName: "transformer"))
+    guard let config = inferTransformerConfig(fromTensorShapes: shapes) else {
+      throw CocoaError(.fileReadCorruptFile)
+    }
+    return config
+  }
+
+  static func inferTransformerConfig(fromTensorShapes shapes: [String: [Int]]) -> ZImageTransformerConfig? {
+    let layerCount = maxIndex(prefix: "layers", in: shapes.keys).map { $0 + 1 } ?? 0
+    let noiseRefinerCount = maxIndex(prefix: "noise_refiner", in: shapes.keys).map { $0 + 1 } ?? 0
+    let contextRefinerCount = maxIndex(prefix: "context_refiner", in: shapes.keys).map { $0 + 1 } ?? 0
+    let refinerCount = max(noiseRefinerCount, contextRefinerCount)
+
+    guard let qShape = shapes["layers.0.attention.to_q.weight"] ?? shapes["noise_refiner.0.attention.to_q.weight"],
+          qShape.count == 2,
+          let normShape = shapes["layers.0.attention.norm_q.weight"] ?? shapes["noise_refiner.0.attention.norm_q.weight"],
+          let headDim = normShape.first,
+          headDim > 0 else {
+      return nil
+    }
+
+    let dim = qShape[0]
+    let nHeads = max(1, dim / headDim)
+    let nKVHeads: Int
+    if let kShape = shapes["layers.0.attention.to_k.weight"] ?? shapes["noise_refiner.0.attention.to_k.weight"], kShape.count == 2 {
+      nKVHeads = max(1, kShape[0] / headDim)
+    } else {
+      nKVHeads = nHeads
+    }
+
+    let capFeatDim = (shapes["cap_embedder.1.weight"]?.count == 2 ? shapes["cap_embedder.1.weight"]?[1] : nil) ?? 2560
+    let patchVolume = (shapes["all_x_embedder.2-1.weight"]?.count == 2 ? shapes["all_x_embedder.2-1.weight"]?[1] : nil) ?? 64
+    let inChannels = max(1, patchVolume / 4)
+
+    return ZImageTransformerConfig(
+      inChannels: inChannels,
+      dim: dim,
+      nLayers: layerCount,
+      nRefinerLayers: refinerCount,
+      nHeads: nHeads,
+      nKVHeads: nKVHeads,
+      normEps: 1e-5,
+      qkNorm: shapes.keys.contains("layers.0.attention.norm_q.weight") || shapes.keys.contains("noise_refiner.0.attention.norm_q.weight"),
+      capFeatDim: capFeatDim,
+      ropeTheta: 256.0,
+      tScale: 1000.0,
+      axesDims: [32, 48, 48],
+      axesLens: [1536, 512, 512]
+    )
+  }
+
+  static func inferTextEncoderConfig(from directory: URL) throws -> ZImageTextEncoderConfig {
+    let shapes = try loadTensorShapes(from: ZImageFiles.resolveWeightFiles(in: directory, componentName: "text_encoder"))
+    guard let config = inferTextEncoderConfig(fromTensorShapes: shapes) else {
+      throw CocoaError(.fileReadCorruptFile)
+    }
+    return config
+  }
+
+  static func inferTextEncoderConfig(fromTensorShapes shapes: [String: [Int]]) -> ZImageTextEncoderConfig? {
+    guard let embedShape = shapes["model.embed_tokens.weight"], embedShape.count == 2 else {
+      return nil
+    }
+    let hiddenSize = embedShape[1]
+    let vocabSize = embedShape[0]
+    let numHiddenLayers = (maxIndex(prefix: "model.layers", in: shapes.keys).map { $0 + 1 }) ?? 0
+
+    guard let qShape = shapes["model.layers.0.self_attn.q_proj.weight"], qShape.count == 2,
+          let kShape = shapes["model.layers.0.self_attn.k_proj.weight"], kShape.count == 2 else {
+      return nil
+    }
+
+    let headDim = (shapes["model.layers.0.self_attn.q_norm.weight"]?.first)
+      ?? (shapes["model.layers.0.self_attn.k_norm.weight"]?.first)
+      ?? 128
+    let numAttentionHeads = max(1, qShape[0] / headDim)
+    let numKeyValueHeads = max(1, kShape[0] / headDim)
+    let intermediateSize = (shapes["model.layers.0.mlp.gate_proj.weight"]?.first)
+      ?? (shapes["model.layers.0.mlp.up_proj.weight"]?.first)
+      ?? hiddenSize * 4
+
+    return ZImageTextEncoderConfig(
+      hiddenSize: hiddenSize,
+      numHiddenLayers: numHiddenLayers,
+      numAttentionHeads: numAttentionHeads,
+      numKeyValueHeads: numKeyValueHeads,
+      intermediateSize: intermediateSize,
+      maxPositionEmbeddings: 40960,
+      ropeTheta: 1_000_000,
+      vocabSize: vocabSize,
+      rmsNormEps: 1e-6,
+      headDim: headDim
+    )
+  }
+
+  static func inferVAEConfig(from snapshot: URL) throws -> ZImageVAEConfig {
+    _ = snapshot
+    // We do not have a reliable VAE config inference path yet. Keep local checkpoints
+    // working by using the known Z-Image-Turbo defaults until a real shape-based
+    // inference implementation is added.
+    return defaultVAEConfig
+  }
+
+  private static func loadTensorShapes(from files: [URL]) throws -> [String: [Int]] {
+    var shapes: [String: [Int]] = [:]
+    for file in files {
+      let reader = try SafeTensorsReader(fileURL: file)
+      for metadata in reader.allMetadata() {
+        shapes[metadata.name] = metadata.shape
+      }
+    }
+    return shapes
+  }
+
+  private static func maxIndex(prefix: String, in keys: Dictionary<String, [Int]>.Keys) -> Int? {
+    let prefixComponents = prefix.split(separator: ".").map(String.init)
+    return keys.compactMap { key in
+      let components = key.split(separator: ".").map(String.init)
+      guard components.count > prefixComponents.count else { return nil }
+      guard Array(components.prefix(prefixComponents.count)) == prefixComponents else { return nil }
+      return Int(components[prefixComponents.count])
+    }.max()
   }
 }

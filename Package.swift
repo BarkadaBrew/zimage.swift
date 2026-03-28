@@ -12,7 +12,7 @@ let package = Package(
     .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
     .package(
       url: "https://github.com/huggingface/swift-transformers",
-      .upToNextMinor(from: "0.1.24")
+      from: "1.1.6"
     ),
     .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4")
   ],

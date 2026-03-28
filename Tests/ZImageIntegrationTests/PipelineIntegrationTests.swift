@@ -232,7 +232,7 @@ final class PipelineIntegrationTests: XCTestCase {
       )
     )
     let textEncoderWeights = try weightsMapper.loadTextEncoder()
-    ZImageWeightsMapping.applyTextEncoder(weights: textEncoderWeights, to: textEncoder, manifest: quantManifest, logger: logger)
+    try ZImageWeightsMapping.applyTextEncoder(weights: textEncoderWeights, to: textEncoder, manifest: quantManifest, logger: logger)
 
     let originalPrompt = "a cat"
     let config = PromptEnhanceConfig(

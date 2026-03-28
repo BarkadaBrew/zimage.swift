@@ -65,6 +65,7 @@ public struct LoRAKeyMapper {
                 "layers.\(i).feed_forward.w1.weight",
                 "layers.\(i).feed_forward.w2.weight",
                 "layers.\(i).feed_forward.w3.weight",
+                "layers.\(i).adaLN_modulation.0.weight",
             ])
         }
 
@@ -77,6 +78,7 @@ public struct LoRAKeyMapper {
                 "noise_refiner.\(i).feed_forward.w1.weight",
                 "noise_refiner.\(i).feed_forward.w2.weight",
                 "noise_refiner.\(i).feed_forward.w3.weight",
+                "noise_refiner.\(i).adaLN_modulation.0.weight",
             ])
         }
 
@@ -89,6 +91,7 @@ public struct LoRAKeyMapper {
                 "context_refiner.\(i).feed_forward.w1.weight",
                 "context_refiner.\(i).feed_forward.w2.weight",
                 "context_refiner.\(i).feed_forward.w3.weight",
+                "context_refiner.\(i).adaLN_modulation.0.weight",
             ])
         }
 

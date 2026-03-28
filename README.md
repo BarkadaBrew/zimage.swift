@@ -4,6 +4,8 @@ Swift port of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) u
 
 This fork adds **SVG vector output** and **multi-LoRA support**.
 
+Reviewer handoff for the Barkada fork work lives at [`docs/review-handoff-barkada-fork-2026-03-28.md`](docs/review-handoff-barkada-fork-2026-03-28.md).
+
 **Try it with an easy UI:** [Lingdong Desktop App](https://lingdong.app/en)
 
 ## What's New in This Fork
@@ -94,8 +96,8 @@ ZImageCLI -h
 | `--cache-limit` | GPU memory cache limit in MB | unlimited |
 | `-l, --lora` | LoRA weights path or HuggingFace ID (single) | - |
 | `--lora-scale` | LoRA scale factor | 1.0 |
-| `--lora-paths` | Multiple LoRA paths (space-separated) | - |
-| `--lora-scales` | Multiple LoRA scales (space-separated) | 1.0 each |
+| `--lora-paths` | Multiple LoRA paths (comma-separated) | - |
+| `--lora-scales` | Multiple LoRA scales (comma-separated) | 1.0 each |
 | `-e, --enhance` | Enhance prompt using LLM | false |
 | `--enhance-max-tokens` | Max tokens for prompt enhancement | 512 |
 | `--no-progress` | Disable progress output | false |
@@ -142,8 +144,8 @@ ZImageCLI -p "a lion" --lora ostris/z_image_turbo_childrens_drawings -o lion.png
 
 # With multiple LoRAs (new in this fork)
 ZImageCLI -p "a beautiful portrait" \
-  --lora-paths style1.safetensors style2.safetensors \
-  --lora-scales 0.8 0.5 \
+  --lora style1.safetensors=0.8 \
+  --lora style2.safetensors=0.5 \
   -o portrait.png
 
 # Generate with SVG output (new in this fork)
@@ -173,14 +175,16 @@ Combine multiple LoRA styles:
 
 ```bash
 ZImageCLI -p "a fantasy portrait" \
-  --lora-paths ~/loras/style.safetensors ~/loras/detail.safetensors \
-  --lora-scales 0.8 0.6 \
+  --lora ~/loras/style.safetensors=0.8 \
+  --lora ~/loras/detail.safetensors=0.6 \
   -o combined.png
 ```
 
-- `--lora-paths`: Space-separated list of LoRA file paths or HuggingFace IDs
+- `--lora`: Repeatable. Prefer `path=scale` to bind a scale to a specific entry.
+- `--lora-paths`: Comma-separated list of LoRA file paths or HuggingFace IDs
 - `--lora-scales`: Corresponding scale factors (defaults to 1.0 if not specified)
-- Scales are matched positionally to paths
+- `path:scale` is still accepted for backward compatibility when unambiguous
+- Quoted commas are not supported in comma-separated forms
 
 ### LoRA Example
 

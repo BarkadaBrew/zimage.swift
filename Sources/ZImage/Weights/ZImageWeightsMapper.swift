@@ -6,10 +6,12 @@ import MLX
 public struct ZImageWeightsMapper {
   private let snapshot: URL
   private let logger: Logger
+  private let textEncoderDirectory: URL?
 
-  public init(snapshot: URL, logger: Logger) {
+  public init(snapshot: URL, logger: Logger, textEncoderDirectory: URL? = nil) {
     self.snapshot = snapshot
     self.logger = logger
+    self.textEncoderDirectory = textEncoderDirectory
   }
 
   public func hasQuantization() -> Bool {
@@ -31,6 +33,9 @@ public struct ZImageWeightsMapper {
   }
 
   public func loadTextEncoder(dtype: DType? = .bfloat16) throws -> [String: MLXArray] {
+    if let textEncoderDirectory {
+      return try loadStandardComponent(urls: ZImageFiles.resolveWeightFiles(in: textEncoderDirectory, componentName: "text_encoder"), dtype: dtype)
+    }
     if hasQuantization() {
       return try loadQuantizedComponent("text_encoder")
     }
@@ -72,7 +77,7 @@ public struct ZImageWeightsMapper {
       }
       return tensors
     }
-    return try loadStandardComponent(files: ZImageFiles.vaeWeights, dtype: dtype)
+    return try loadStandardComponent(files: ZImageFiles.resolveVAEWeights(at: snapshot), dtype: dtype)
   }
 
   /// Load controlnet weights from a standalone safetensors file
@@ -105,11 +110,14 @@ public struct ZImageWeightsMapper {
   }
 
   private func loadStandardComponent(files: [String], dtype: DType?) throws -> [String: MLXArray] {
+    try loadStandardComponent(urls: files.map { snapshot.appending(path: $0) }, dtype: dtype)
+  }
+
+  private func loadStandardComponent(urls: [URL], dtype: DType?) throws -> [String: MLXArray] {
     var tensors: [String: MLXArray] = [:]
-    for relative in files {
-      let url = snapshot.appending(path: relative)
+    for url in urls {
       guard FileManager.default.fileExists(atPath: url.path) else {
-        logger.warning("Weight shard missing: \(relative)")
+        logger.warning("Weight shard missing: \(url.path)")
         continue
       }
       let reader = try SafeTensorsReader(fileURL: url)
@@ -153,10 +161,10 @@ public struct ZImageWeightsMapper {
     for (key, value) in try loadStandardComponent(files: ZImageFiles.resolveTransformerWeights(at: snapshot), dtype: dtype) {
       tensors["transformer.\(key)"] = value
     }
-    for (key, value) in try loadStandardComponent(files: ZImageFiles.resolveTextEncoderWeights(at: snapshot), dtype: dtype) {
+    for (key, value) in try loadTextEncoder(dtype: dtype) {
       tensors["text_encoder.\(key)"] = value
     }
-    for (key, value) in try loadStandardComponent(files: ZImageFiles.vaeWeights, dtype: dtype) {
+    for (key, value) in try loadStandardComponent(files: ZImageFiles.resolveVAEWeights(at: snapshot), dtype: dtype) {
       tensors["vae.\(key)"] = value
     }
 

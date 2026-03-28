@@ -26,7 +26,7 @@ public struct LoRAConfiguration: Sendable, Equatable {
 
     public init(source: LoRASource, scale: Float = 1.0) {
         self.source = source
-        self.scale = max(0.0, min(1.0, scale))
+        self.scale = scale
     }
 
     public static func local(_ path: String, scale: Float = 1.0) -> LoRAConfiguration {

@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import MLX
 import MLXNN
 
@@ -13,7 +14,9 @@ public enum PipelineUtilities {
         textEncoder: QwenTextEncoder,
         maxLength: Int
     ) throws -> (embeddings: MLXArray, mask: MLXArray) {
-        let encoded = try tokenizer.encodeChat(prompts: [prompt], maxLength: maxLength)
+        // Z-Image expects raw prompt tokenization here. Chat-template wrapping
+        // changes the sequence format and broke prompt encoding for the bf16 fork checkpoints.
+        let encoded = tokenizer.encodePlain(prompts: [prompt], maxLength: maxLength)
         let embeddingsList = textEncoder.encodeForZImage(
             inputIds: encoded.inputIds,
             attentionMask: encoded.attentionMask
@@ -27,6 +30,57 @@ public enum PipelineUtilities {
         let mask = MLX.ones([1, firstEmbeds.dim(0)], dtype: .int32)
 
         return (embedsBatch, mask)
+    }
+
+    public static func resolveTextEncoderSelection(
+        for snapshot: URL,
+        overridePath: String?,
+        logger: Logger? = nil
+    ) -> TextEncoderSelection {
+        let selection = ZImageFiles.resolveTextEncoderSelection(at: snapshot, overridePath: overridePath)
+        if let logger {
+            let sourceDescription: String
+            switch selection.source {
+            case .overridePath:
+                sourceDescription = "CLI override"
+            case .environment:
+                sourceDescription = "ZIMAGE_ENCODER_PATH"
+            case .autoDetectedPreferred:
+                sourceDescription = "auto-detected preferred encoder"
+            case .defaultDirectory:
+                sourceDescription = "default text_encoder directory"
+            }
+            logger.info("Using text encoder directory: \(selection.directory.path) (\(sourceDescription))")
+        }
+        return selection
+    }
+
+    public static func alignNegativeEmbeddingsIfNeeded(
+        promptEmbeds: MLXArray,
+        negativeEmbeds: MLXArray
+    ) -> (prompt: MLXArray, negative: MLXArray) {
+        let promptSequenceLength = promptEmbeds.dim(1)
+        let negativeSequenceLength = negativeEmbeds.dim(1)
+        guard promptSequenceLength != negativeSequenceLength else {
+            return (promptEmbeds, negativeEmbeds)
+        }
+
+        let targetLength = max(promptSequenceLength, negativeSequenceLength)
+        let hiddenDim = promptEmbeds.dim(2)
+        var alignedPrompt = promptEmbeds
+        var alignedNegative = negativeEmbeds
+
+        if promptSequenceLength < targetLength {
+            let padding = MLX.zeros([1, targetLength - promptSequenceLength, hiddenDim], dtype: promptEmbeds.dtype)
+            alignedPrompt = MLX.concatenated([promptEmbeds, padding], axis: 1)
+        }
+
+        if negativeSequenceLength < targetLength {
+            let padding = MLX.zeros([1, targetLength - negativeSequenceLength, hiddenDim], dtype: negativeEmbeds.dtype)
+            alignedNegative = MLX.concatenated([negativeEmbeds, padding], axis: 1)
+        }
+
+        return (alignedPrompt, alignedNegative)
     }
 
     public static func decodeLatents(
