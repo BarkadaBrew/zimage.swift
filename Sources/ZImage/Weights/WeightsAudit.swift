@@ -3,14 +3,14 @@ import Logging
 import MLXNN
 import MLX
 
-struct WeightsAudit {
-  struct Summary {
-    let matched: Int
-    let missing: [String]
-    let extra: [String]
+public struct WeightsAudit {
+  public struct Summary: Sendable {
+    public let matched: Int
+    public let missing: [String]
+    public let extra: [String]
   }
 
-  static func audit(module: Module, weights: [String: MLXArray], prefix: String = "", logger: Logger, sample: Int = 5) -> Summary {
+  public static func audit(module: Module, weights: [String: MLXArray], prefix: String = "", logger: Logger, sample: Int = 5) -> Summary {
     let params = module.parameters().flattened()
     var matched = 0
     var missingKeys: [String] = []
@@ -46,5 +46,39 @@ struct WeightsAudit {
     }
 
     return Summary(matched: matched, missing: missingKeys, extra: Array(remaining))
+  }
+
+  public static func shapeMismatches(
+    module: Module,
+    weights: [String: MLXArray],
+    prefix: String = "",
+    logger: Logger,
+    transpose4DTensors: Bool = false,
+    sample: Int = 5
+  ) -> [String] {
+    let params = module.parameters().flattened()
+    var mismatches: [String] = []
+
+    for (key, param) in params {
+      let candidate1 = key
+      let candidate2 = prefix.isEmpty ? key : "\(prefix).\(key)"
+      guard var tensor = weights[candidate1] ?? weights[candidate2] else { continue }
+
+      if transpose4DTensors && tensor.ndim == 4 {
+        tensor = ZImageWeightsMapping.alignTensorShape(tensor, to: param.shape)
+      }
+
+      if tensor.shape != param.shape {
+        mismatches.append("\(candidate2) expected \(param.shape) got \(tensor.shape)")
+      }
+    }
+
+    if !mismatches.isEmpty {
+      let sampleText = mismatches.prefix(max(0, sample)).joined(separator: "; ")
+      let suffix = mismatches.count > sample ? "; ..." : ""
+      logger.warning("\(prefix.isEmpty ? "module" : prefix) shape mismatches: \(mismatches.count) (sample: \(sampleText)\(suffix))")
+    }
+
+    return mismatches
   }
 }

@@ -29,7 +29,8 @@ struct ZImageCLI {
   }()
 
   static func run() throws {
-    if let dev = MTLCreateSystemDefaultDevice() {
+    let metalDevice = MTLCreateSystemDefaultDevice()
+    if let dev = metalDevice {
       logger.info("Metal device: \(dev.name)")
     } else {
       logger.warning("No Metal device detected; MLX will fall back to CPU.")
@@ -59,6 +60,7 @@ struct ZImageCLI {
     var enhancePrompt = false
     var enhanceMaxTokens = 512
     var noProgress = false
+    var auditWeights = false
     var forceTransformerOverrideOnly = false
     var generateSVG = false
     var svgPreset = "default"
@@ -108,6 +110,8 @@ struct ZImageCLI {
         enhanceMaxTokens = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: 512)
       case "--no-progress":
         noProgress = true
+      case "--audit-weights":
+        auditWeights = true
       case "--svg":
         generateSVG = true
       case "--svg-preset":
@@ -127,6 +131,34 @@ struct ZImageCLI {
       default:
         logger.warning("Unknown argument: \(arg)")
       }
+    }
+
+    if auditWeights {
+      guard metalDevice != nil else {
+        throw NSError(
+          domain: "ZImageCLI",
+          code: 2,
+          userInfo: [NSLocalizedDescriptionKey: "--audit-weights currently requires a Metal-capable runtime in this build."]
+        )
+      }
+      let capturedModel = model
+      let capturedTextEncoderPath = textEncoderPath
+      let taskError = Box<Error?>(nil)
+      nonisolated(unsafe) let semaphore = DispatchSemaphore(value: 0)
+      Task {
+        do {
+          try await runAudit(modelSpec: capturedModel, textEncoderPath: capturedTextEncoderPath)
+        } catch {
+          logger.error("Weight audit failed: \(error)")
+          taskError.value = error
+        }
+        semaphore.signal()
+      }
+      semaphore.wait()
+      if let error = taskError.value {
+        throw error
+      }
+      return
     }
 
     guard let prompt else {
@@ -240,6 +272,15 @@ struct ZImageCLI {
     }
   }
 
+  private static func runAudit(modelSpec: String?, textEncoderPath: String?) async throws {
+    let report = try await ZImageModelAuditor.audit(
+      modelSpec: modelSpec,
+      textEncoderPath: textEncoderPath,
+      logger: logger
+    )
+    print(report.formattedDescription())
+  }
+
   private static func printUsage() {
     print("""
     Z-Image-Turbo Swift port
@@ -265,6 +306,7 @@ struct ZImageCLI {
       --enhance, -e          Enhance prompt using LLM (requires ~5GB extra VRAM)
       --enhance-max-tokens   Max tokens for prompt enhancement (default: 512)
       --no-progress          Disable progress output
+      --audit-weights        Audit transformer/text encoder/VAE weight coverage and exit
       --svg                  Also generate SVG vector output (requires vtracer)
       --svg-preset           SVG preset: default, logo, detailed, simplified, bw
       --help, -h             Show help
@@ -951,4 +993,9 @@ private final class ProgressBar {
   }
 }
 
-try ZImageCLI.run()
+do {
+  try ZImageCLI.run()
+} catch {
+  fputs("Error: \(error.localizedDescription)\n", stderr)
+  exit(1)
+}
