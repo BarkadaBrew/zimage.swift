@@ -1,4 +1,5 @@
 import XCTest
+import MLX
 import Logging
 @testable import ZImage
 
@@ -32,6 +33,17 @@ final class TransformerWeightNormalizationTests: XCTestCase {
     XCTAssertEqual(weights["all_final_layer.2-1.adaLN_modulation.0.weight"]?.shape, [6, 2])
     XCTAssertEqual(weights["all_final_layer.2-1.adaLN_modulation.1.weight"]?.shape, [6, 2])
     XCTAssertEqual(weights["all_final_layer.2-1.adaLN_modulation.1.bias"]?.shape, [6])
+  }
+
+  func testFinalLayerAdaLNAliasAppliesToAnyFinalLayerKey() {
+    let value = MLXArray([Float(0.0)])
+    let normalized = ZImageTransformerWeightAliases.normalized([
+      "all_final_layer.custom-key.adaLN_modulation.0.weight": value,
+      "all_final_layer.custom-key.adaLN_modulation.0.bias": value,
+    ])
+
+    XCTAssertNotNil(normalized["all_final_layer.custom-key.adaLN_modulation.1.weight"])
+    XCTAssertNotNil(normalized["all_final_layer.custom-key.adaLN_modulation.1.bias"])
   }
 
   private func makeTempDirectory() throws -> URL {

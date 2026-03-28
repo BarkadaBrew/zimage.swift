@@ -26,18 +26,25 @@ enum ZImageTransformerWeightAliases {
       in: &normalized
     )
 
-    addAlias(
-      from: "all_final_layer.2-1.adaLN_modulation.0.weight",
-      to: "all_final_layer.2-1.adaLN_modulation.1.weight",
-      in: &normalized
-    )
-    addAlias(
-      from: "all_final_layer.2-1.adaLN_modulation.0.bias",
-      to: "all_final_layer.2-1.adaLN_modulation.1.bias",
-      in: &normalized
-    )
+    addFinalLayerAdaLNAliases(in: &normalized)
 
     return normalized
+  }
+
+  private static func addFinalLayerAdaLNAliases(in weights: inout [String: MLXArray]) {
+    for key in Array(weights.keys) {
+      guard key.hasPrefix("all_final_layer.") else { continue }
+      let aliasKey: String
+      if key.contains(".adaLN_modulation.0.weight") {
+        aliasKey = key.replacingOccurrences(of: ".adaLN_modulation.0.weight", with: ".adaLN_modulation.1.weight")
+      } else if key.contains(".adaLN_modulation.0.bias") {
+        aliasKey = key.replacingOccurrences(of: ".adaLN_modulation.0.bias", with: ".adaLN_modulation.1.bias")
+      } else {
+        continue
+      }
+
+      addAlias(from: key, to: aliasKey, in: &weights)
+    }
   }
 
   private static func addAlias(from sourceKey: String, to aliasKey: String, in weights: inout [String: MLXArray]) {
