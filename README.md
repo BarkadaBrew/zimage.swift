@@ -39,7 +39,7 @@ sudo ./install.sh
 
 This installs:
 - Binary to `/usr/local/lib/zimage/ZImageCLI`
-- Metal libraries to `/usr/local/lib/zimage/mlx-swift_Cmlx.bundle`
+- Metal library to `/usr/local/lib/zimage/mlx.metallib`
 - Wrapper script to `/usr/local/bin/ZImageCLI`
 
 ### Building from Source
