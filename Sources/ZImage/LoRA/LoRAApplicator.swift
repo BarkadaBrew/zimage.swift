@@ -75,6 +75,22 @@ public struct LoRAApplicator {
         return (down: normalized.down, up: slicedUp)
     }
 
+    private static func normalizedLoRAPair(
+        down: MLXArray,
+        up: MLXArray,
+        targetShape: [Int]
+    ) -> (down: MLXArray, up: MLXArray)? {
+        guard targetShape.count >= 2 else { return nil }
+        let outFeatures = targetShape[targetShape.count - 2]
+        let inFeatures = targetShape[targetShape.count - 1]
+        return normalizeLoRAPair(
+            down: down,
+            up: up,
+            inFeatures: inFeatures,
+            outFeatures: outFeatures
+        )
+    }
+
     public static func mergeWeights(
         baseWeights: [String: MLXArray],
         loraWeights: LoRAWeights,
@@ -98,8 +114,18 @@ public struct LoRAApplicator {
                 continue
             }
 
-            guard let delta = computeDelta(up: up, down: down) else {
+            guard let normalized = normalizedLoRAPair(
+                down: down,
+                up: up,
+                targetShape: baseWeight.shape
+            ) else {
                 logger?.warning("LoRA weight shapes incompatible for '\(weightKey)': up=\(up.shape), down=\(down.shape)")
+                skippedCount += 1
+                continue
+            }
+
+            guard let delta = computeDelta(up: normalized.up, down: normalized.down) else {
+                logger?.warning("LoRA weight shapes incompatible for '\(weightKey)' after normalization: up=\(normalized.up.shape), down=\(normalized.down.shape)")
                 skippedCount += 1
                 continue
             }
@@ -141,8 +167,19 @@ public struct LoRAApplicator {
                 continue
             }
 
-            guard let delta = computeDelta(up: up, down: down) else {
+            guard let dims = linearDims(for: module),
+                  let normalized = normalizeLoRAPair(
+                    down: down,
+                    up: up,
+                    inFeatures: dims.in,
+                    outFeatures: dims.out
+                  ) else {
                 logger?.debug("LoRA shape mismatch for \(key): up=\(up.shape), down=\(down.shape)")
+                continue
+            }
+
+            guard let delta = computeDelta(up: normalized.up, down: normalized.down) else {
+                logger?.debug("LoRA shape mismatch for \(key) after normalization: up=\(normalized.up.shape), down=\(normalized.down.shape)")
                 continue
             }
 
@@ -214,7 +251,12 @@ public struct LoRAApplicator {
             let weightKey = keyPath.hasSuffix(".weight") ? keyPath : keyPath + ".weight"
 
             guard let currentWeight = restored[weightKey],
-                  let delta = computeDelta(up: up, down: down),
+                  let normalized = normalizedLoRAPair(
+                    down: down,
+                    up: up,
+                    targetShape: currentWeight.shape
+                  ),
+                  let delta = computeDelta(up: normalized.up, down: normalized.down),
                   let alignedDelta = alignShape(delta, to: currentWeight.shape) else {
                 continue
             }
@@ -226,23 +268,12 @@ public struct LoRAApplicator {
     }
 
     private static func computeDelta(up: MLXArray, down: MLXArray) -> MLXArray? {
-        if up.dim(1) == down.dim(0) {
-            return MLX.matmul(up, down)
-        } else if up.dim(0) == down.dim(1) {
-            return MLX.matmul(up.T, down.T)
-        } else if up.dim(1) == down.dim(1) {
-            return MLX.matmul(up, down.T)
-        }
-        return nil
+        guard up.ndim == 2, down.ndim == 2, up.dim(1) == down.dim(0) else { return nil }
+        return MLX.matmul(up, down)
     }
 
     private static func alignShape(_ delta: MLXArray, to targetShape: [Int]) -> MLXArray? {
-        if delta.shape == targetShape {
-            return delta
-        } else if delta.T.shape == targetShape {
-            return delta.T
-        }
-        return nil
+        delta.shape == targetShape ? delta : nil
     }
 
     public static func applyLoKr<T: Module>(
