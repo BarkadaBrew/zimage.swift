@@ -915,7 +915,7 @@ public final class ZImagePipeline {
       }
       out[mapped] = v
     }
-    return out
+    return ZImageTransformerWeightAliases.normalized(out)
   }
 
   func validateStrictAIOTransformerWeights(_ weights: [String: MLXArray], config: ZImageTransformerConfig) throws {

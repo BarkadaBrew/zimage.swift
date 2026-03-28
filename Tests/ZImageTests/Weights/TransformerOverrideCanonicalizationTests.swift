@@ -63,6 +63,28 @@ final class TransformerOverrideCanonicalizationTests: XCTestCase {
     XCTAssertNotNil(result["all_final_layer.2-1.adaLN_modulation.1.weight"])
   }
 
+  func testFinalLayerMfluxAliasRemapsToAdaLNLinearSlot() {
+    let pipeline = ZImagePipeline(logger: Logger(label: "test"))
+    let w = MLXArray([Float(0.0)])
+    let input = ["all_final_layer.2-1.adaLN_modulation.0.weight": w]
+
+    let result = pipeline.canonicalizeTransformerOverride(input, dim: 2, logger: Logger(label: "test"))
+    XCTAssertNotNil(result["all_final_layer.2-1.adaLN_modulation.1.weight"])
+  }
+
+  func testTimestepEmbedderLinearAliasesRemapToMLPSlots() {
+    let pipeline = ZImagePipeline(logger: Logger(label: "test"))
+    let w = MLXArray([Float(0.0)])
+    let input = [
+      "t_embedder.linear1.weight": w,
+      "t_embedder.linear2.bias": w,
+    ]
+
+    let result = pipeline.canonicalizeTransformerOverride(input, dim: 2, logger: Logger(label: "test"))
+    XCTAssertNotNil(result["t_embedder.mlp.0.weight"])
+    XCTAssertNotNil(result["t_embedder.mlp.2.bias"])
+  }
+
   func testRenamesQKNormKeys() {
     let pipeline = ZImagePipeline(logger: Logger(label: "test"))
     let w = MLXArray([Float(0.0), Float(1.0)]).asType(.bfloat16)
