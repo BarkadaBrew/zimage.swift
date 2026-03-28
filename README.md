@@ -28,12 +28,12 @@ Reviewer handoff for the Barkada fork work lives at [`docs/review-handoff-barkad
 
 ### Pre-built Binary (Recommended)
 
-Download and install the latest release:
+Download and install the latest Barkada release:
 
 ```bash
-curl -LO https://github.com/twalderman/zimage.swift/releases/download/v0.2.0-tw/ZImageCLI-v0.2.0-tw-macos-arm64.tar.gz
-tar -xzf ZImageCLI-v0.2.0-tw-macos-arm64.tar.gz
-cd ZImageCLI-v0.2.0-tw
+curl -LO https://github.com/BarkadaBrew/zimage.swift/releases/download/0.2.0/ZImageCLI-0.2.0-macos-arm64.tar.gz
+tar -xzf ZImageCLI-0.2.0-macos-arm64.tar.gz
+cd ZImageCLI-0.2.0
 sudo ./install.sh
 ```
 
