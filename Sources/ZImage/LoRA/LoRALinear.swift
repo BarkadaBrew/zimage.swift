@@ -6,11 +6,24 @@ public struct LoRAAdapter {
     public let down: MLXArray
     public let up: MLXArray
     public let scale: Float
+    public let computeDType: DType
 
     public init(down: MLXArray, up: MLXArray, scale: Float) {
-        self.down = down
-        self.up = up
+        let preferredType = LoRAAdapter.preferredComputeDType(down: down, up: up)
+        self.down = down.dtype == preferredType ? down : down.asType(preferredType)
+        self.up = up.dtype == preferredType ? up : up.asType(preferredType)
         self.scale = scale
+        self.computeDType = preferredType
+    }
+
+    private static func preferredComputeDType(down: MLXArray, up: MLXArray) -> DType {
+        if down.dtype == .float32 || up.dtype == .float32 {
+            return .float32
+        }
+        if down.dtype == .bfloat16 || down.dtype == .float16 || up.dtype == .bfloat16 || up.dtype == .float16 {
+            return .float32
+        }
+        return down.dtype == up.dtype ? down.dtype : .float32
     }
 }
 
@@ -39,8 +52,10 @@ extension DynamicLoRACapable {
         }
         var total: MLXArray?
         for adapter in activeAdapters {
-            let loraHidden = MLX.matmul(x, adapter.down.T)
-            let loraOut = MLX.matmul(loraHidden, adapter.up.T) * adapter.scale
+            let input = x.dtype == adapter.computeDType ? x : x.asType(adapter.computeDType)
+            let scale = MLXArray(adapter.scale).asType(adapter.computeDType)
+            let loraHidden = MLX.matmul(input, adapter.down.T)
+            let loraOut = MLX.matmul(loraHidden, adapter.up.T) * scale
             total = total.map { $0 + loraOut } ?? loraOut
         }
         return total
