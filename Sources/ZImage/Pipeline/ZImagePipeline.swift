@@ -70,6 +70,11 @@ public struct ZImageGenerationRequest: Sendable {
 // Pipeline instances cache mutable MLX state and are not thread-safe.
 // Callers should serialize access to a given pipeline instance.
 public final class ZImagePipeline {
+  public enum RetentionPolicy: Sendable {
+    case releaseAfterRender
+    case keepLoaded
+  }
+
   public enum PipelineError: Error, Sendable {
     case notImplemented
     case tokenizerNotLoaded
@@ -84,6 +89,7 @@ public final class ZImagePipeline {
 
   private var logger: Logger
   private let hubApi: HubApi
+  private let retentionPolicy: RetentionPolicy
   private var tokenizer: QwenTokenizer?
   private var textEncoder: QwenTextEncoder?
   private var transformer: ZImageTransformer2DModel?
@@ -106,9 +112,14 @@ public final class ZImagePipeline {
 
   private var currentLoRAs: [AppliedLoRA] = []
 
-  public init(logger: Logger = Logger(label: "z-image.pipeline"), hubApi: HubApi = .shared) {
+  public init(
+    logger: Logger = Logger(label: "z-image.pipeline"),
+    hubApi: HubApi = .shared,
+    retentionPolicy: RetentionPolicy = .releaseAfterRender
+  ) {
     self.logger = logger
     self.hubApi = hubApi
+    self.retentionPolicy = retentionPolicy
   }
   public var isLoaded: Bool {
     return isModelLoaded
@@ -602,6 +613,47 @@ public final class ZImagePipeline {
   public func loadLoRA(_ config: LoRAConfiguration, progressHandler: ProgressHandler? = nil) async throws {
     try await loadLoRAs([config], progressHandler: progressHandler)
   }
+
+  public func prepare(
+    modelSpec: String? = nil,
+    textEncoderPath: String? = nil,
+    loras: [LoRAConfiguration] = [],
+    forceTransformerOverrideOnly: Bool = false,
+    progressHandler: ProgressHandler? = nil
+  ) async throws {
+    let selection = resolveModelSelection(modelSpec, forceTransformerOverrideOnly: forceTransformerOverrideOnly)
+    try await loadModel(
+      modelSpec: selection.baseModelSpec,
+      textEncoderPath: textEncoderPath,
+      aioCheckpointURL: selection.aioCheckpointURL,
+      aioTextEncoderPrefix: selection.aioTextEncoderPrefix,
+      progressHandler: progressHandler
+    )
+
+    if selection.aioCheckpointURL == nil {
+      try applyTransformerOverrideIfNeeded(selection.transformerOverrideURL)
+    }
+
+    try await swapLoRAs(loras, progressHandler: progressHandler)
+  }
+
+  public func swapLoRAs(_ configs: [LoRAConfiguration], progressHandler: ProgressHandler? = nil) async throws {
+    if configs.isEmpty {
+      unloadLoRA()
+      return
+    }
+
+    guard isModelLoaded else {
+      throw PipelineError.modelNotLoaded
+    }
+
+    try await loadLoRAs(configs, progressHandler: progressHandler)
+  }
+
+  public func generateFromRequest(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> URL {
+    try await generate(request, progressHandler: progressHandler)
+  }
+
   public func loadLoRAs(_ configs: [LoRAConfiguration], progressHandler: ProgressHandler? = nil) async throws {
     guard let trans = transformer else {
       throw PipelineError.transformerNotLoaded
@@ -758,7 +810,9 @@ public final class ZImagePipeline {
       }
     }
     logger.info("Text encoding complete")
-    self.textEncoder = nil
+    if retentionPolicy == .releaseAfterRender {
+      self.textEncoder = nil
+    }
     GPU.clearCache()
 
     let vaeDivisor = modelConfigs.vae.latentDivisor
@@ -821,7 +875,12 @@ public final class ZImagePipeline {
     }
 
     progressHandler?(GenerationProgress(stage: .denoising, stepIndex: request.steps, totalSteps: request.steps))
-    unloadTransformer()
+    if retentionPolicy == .releaseAfterRender {
+      unloadTransformer()
+    } else {
+      transformer?.clearCache()
+      GPU.clearCache()
+    }
     logger.info("Denoising complete, decoding with VAE...")
     progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
 

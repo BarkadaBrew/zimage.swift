@@ -128,6 +128,9 @@ struct ZImageCLI {
       case "control":
         try runControl(args: Array(args.dropFirst()))
         return
+      case "serve":
+        try runServe(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -333,6 +336,13 @@ struct ZImageCLI {
         --control-scale      Control scale (default: 0.75)
         Use 'ZImageCLI control --help' for full options
 
+      serve                  Start warm HTTP server
+        --model, -m          Model path or HuggingFace ID
+        --text-encoder-path  Override text encoder directory
+        --port               HTTP port (default 7862)
+        --lora, -l           Initial LoRA(s)
+        Use 'ZImageCLI serve --help' for full options
+
     Examples:
       ZImageCLI -p "a cute cat" -o cat.png
       ZImageCLI -p "a sunset" -m models/z-image-turbo-q8
@@ -340,6 +350,7 @@ struct ZImageCLI {
       ZImageCLI -p "a cut a cat" --lora ostris/z_image_turbo_childrens_drawings
       ZImageCLI -p "portrait" --lora mood.safetensors=0.8 --lora detail.safetensors --lora-scale 0.3
       ZImageCLI -p "cat" --enhance  # Enhanced prompt generation
+      ZImageCLI serve -m ./models/z-image-turbo --port 7862
     """)
   }
 
@@ -563,6 +574,105 @@ struct ZImageCLI {
 
       # From local directory
       ZImageCLI quantize-controlnet -i ./controlnet-union -o ./controlnet-union-q8 --verbose
+    """)
+  }
+
+  private static func runServe(args: [String]) throws {
+    var model: String?
+    var textEncoderPath: String?
+    var port: UInt16 = 7862
+    var cacheLimit: Int?
+    var maxSequenceLength = 512
+    var loraEntries: [String] = []
+    var loraScaleOverrides: [Float] = []
+    var forceTransformerOverrideOnly = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model", "-m":
+        model = nextValue(for: arg, iterator: &iterator)
+      case "--text-encoder-path":
+        textEncoderPath = nextValue(for: arg, iterator: &iterator)
+      case "--port":
+        let rawPort = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: Int(port))
+        guard rawPort <= Int(UInt16.max) else {
+          logger.error("Invalid port: \(rawPort)")
+          return
+        }
+        port = UInt16(rawPort)
+      case "--cache-limit":
+        cacheLimit = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 2048)
+      case "--max-sequence-length":
+        maxSequenceLength = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: 512)
+      case "--force-transformer-override-only":
+        forceTransformerOverrideOnly = true
+      case "--lora", "-l":
+        loraEntries.append(nextValue(for: arg, iterator: &iterator))
+      case "--lora-scale":
+        loraScaleOverrides.append(floatValue(for: arg, iterator: &iterator, fallback: 1.0))
+      case "--lora-paths":
+        loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
+      case "--lora-scales":
+        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+      case "--help", "-h":
+        printServeUsage()
+        return
+      default:
+        logger.warning("Unknown serve argument: \(arg)")
+      }
+    }
+
+    if let limit = cacheLimit {
+      GPU.set(cacheLimit: limit * 1024 * 1024)
+      logger.info("GPU cache limit set to \(limit)MB")
+    }
+
+    let loraConfigs = buildLoRAConfigurations(entries: loraEntries, scaleOverrides: loraScaleOverrides)
+    if !loraConfigs.isEmpty {
+      logger.info("Preloading \(loraConfigs.count) LoRA(s)")
+    }
+
+    let configuration = WarmServerConfiguration(
+      port: port,
+      modelSpec: model,
+      textEncoderPath: textEncoderPath,
+      initialLoRAs: loraConfigs,
+      forceTransformerOverrideOnly: forceTransformerOverrideOnly,
+      maxSequenceLength: maxSequenceLength,
+      maxPendingRequests: 10
+    )
+
+    let server = WarmServer(configuration: configuration, logger: logger)
+    try server.run()
+  }
+
+  private static func printServeUsage() {
+    print("""
+    Start warm HTTP server mode.
+
+    Usage: ZImageCLI serve [options]
+      --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
+      --text-encoder-path       Override text encoder directory
+      --port                    HTTP port (default: 7862)
+      --cache-limit             GPU memory cache limit in MB (default: unlimited)
+      --max-sequence-length     Maximum sequence length for text encoding (default: 512)
+      --force-transformer-override-only  Treat a local .safetensors as transformer-only override
+      --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
+      --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
+      --lora-paths              Comma-separated LoRA paths or HuggingFace IDs
+      --lora-scales             Comma-separated LoRA scale overrides (default: 1.0)
+      --help, -h                Show help
+
+    Endpoints:
+      POST /v1/generate         Submit a render request
+      POST /v1/lora/swap        Hot-swap active LoRAs
+      GET  /health              Report model/server status
+      POST /v1/shutdown         Gracefully stop the server
+
+    Example:
+      ZImageCLI serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7862 \\
+        --lora /path/to/lora.safetensors=0.8
     """)
   }
 
