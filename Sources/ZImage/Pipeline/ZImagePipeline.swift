@@ -250,7 +250,17 @@ public final class ZImagePipeline {
 
   private func encodePrompt(_ prompt: String, tokenizer: QwenTokenizer, textEncoder: QwenTextEncoder, maxLength: Int) throws -> (MLXArray, MLXArray) {
     do {
-      let result = try PipelineUtilities.encodePrompt(prompt, tokenizer: tokenizer, textEncoder: textEncoder, maxLength: maxLength)
+      let promptEncodingMode = ZImageFiles.resolvePromptEncodingMode(
+        at: modelSnapshot,
+        selection: loadedTextEncoderSelection
+      )
+      let result = try PipelineUtilities.encodePrompt(
+        prompt,
+        tokenizer: tokenizer,
+        textEncoder: textEncoder,
+        maxLength: maxLength,
+        mode: promptEncodingMode
+      )
       return (result.embeddings, result.mask)
     } catch {
       logger.error("Prompt encoding failed: \(String(describing: error))")

@@ -28,6 +28,11 @@ public struct TextEncoderSelection: Equatable {
   }
 }
 
+public enum PromptEncodingMode: Equatable {
+  case chatTemplate
+  case plain
+}
+
 public enum ZImageFiles {
   public static let modelIndex = "model_index.json"
   public static let schedulerConfig = "scheduler/scheduler_config.json"
@@ -98,6 +103,22 @@ public enum ZImageFiles {
 
     let defaultDirectory = snapshot.appendingPathComponent(defaultTextEncoderDirectory, isDirectory: true)
     return TextEncoderSelection(directory: defaultDirectory, source: .defaultDirectory)
+  }
+
+  public static func resolvePromptEncodingMode(
+    at snapshot: URL?,
+    selection: TextEncoderSelection?
+  ) -> PromptEncodingMode {
+    guard let snapshot, let selection else {
+      return .chatTemplate
+    }
+
+    let defaultDirectory = snapshot
+      .appendingPathComponent(defaultTextEncoderDirectory, isDirectory: true)
+      .standardizedFileURL
+    let selectedDirectory = selection.directory.standardizedFileURL
+
+    return selectedDirectory == defaultDirectory ? .chatTemplate : .plain
   }
 
   // MARK: - Dynamic weight resolution

@@ -12,11 +12,17 @@ public enum PipelineUtilities {
         _ prompt: String,
         tokenizer: QwenTokenizer,
         textEncoder: QwenTextEncoder,
-        maxLength: Int
+        maxLength: Int,
+        mode: PromptEncodingMode = .chatTemplate
     ) throws -> (embeddings: MLXArray, mask: MLXArray) {
-        // Z-Image expects raw prompt tokenization here. Chat-template wrapping
-        // changes the sequence format and broke prompt encoding for the bf16 fork checkpoints.
-        let encoded = tokenizer.encodePlain(prompts: [prompt], maxLength: maxLength)
+        let encoded: QwenTokenBatch
+        switch mode {
+        case .chatTemplate:
+            encoded = try tokenizer.encodeChat(prompts: [prompt], maxLength: maxLength)
+        case .plain:
+            // Barkada custom encoders expect raw prompt tokenization here.
+            encoded = tokenizer.encodePlain(prompts: [prompt], maxLength: maxLength)
+        }
         let embeddingsList = textEncoder.encodeForZImage(
             inputIds: encoded.inputIds,
             attentionMask: encoded.attentionMask

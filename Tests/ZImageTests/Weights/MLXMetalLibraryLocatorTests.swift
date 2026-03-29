@@ -40,6 +40,24 @@ final class MLXMetalLibraryLocatorTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: staged!), releaseContents)
   }
 
+  func testPrepareColocatedMetalLibraryReplacesSwiftPMReleaseLibraryWithXcodeReleaseFallback() throws {
+    let packageRoot = try makeTempPackageRoot()
+    defer { try? FileManager.default.removeItem(at: packageRoot) }
+
+    let executableURL = packageRoot.appendingPathComponent(".build/release/ZImageCLI")
+    let colocatedLibrary = packageRoot.appendingPathComponent(".build/release/mlx.metallib")
+    let xcodeReleaseLibrary = packageRoot.appendingPathComponent(".build/xcode/Build/Products/Release/mlx.metallib")
+
+    try writeFile(at: executableURL, contents: Data("cli".utf8))
+    try writeFile(at: colocatedLibrary, contents: Data("swiftpm-release".utf8))
+    try writeFile(at: xcodeReleaseLibrary, contents: Data("xcode-release".utf8))
+
+    let staged = try MLXMetalLibraryLocator.prepareColocatedMetalLibrary(executableURL: executableURL)
+
+    XCTAssertEqual(staged?.standardizedFileURL.path, colocatedLibrary.standardizedFileURL.path)
+    XCTAssertEqual(try Data(contentsOf: colocatedLibrary), Data("xcode-release".utf8))
+  }
+
   private func makeTempPackageRoot() throws -> URL {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

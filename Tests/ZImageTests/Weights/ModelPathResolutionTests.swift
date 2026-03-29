@@ -82,6 +82,87 @@ final class ModelPathResolutionTests: XCTestCase {
     XCTAssertEqual(defaultSelection.source, .defaultDirectory)
   }
 
+  func testPromptEncodingModeUsesChatForDefaultDirectoryEvenWhenSelectedExplicitly() throws {
+    let modelDir = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: modelDir) }
+
+    let standardDir = modelDir.appendingPathComponent("text_encoder")
+    try makeDirectory(standardDir)
+    FileManager.default.createFile(
+      atPath: standardDir.appendingPathComponent("model.safetensors").path,
+      contents: Data(),
+      attributes: nil
+    )
+
+    let defaultSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: nil,
+      environment: [:]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: defaultSelection),
+      .chatTemplate
+    )
+
+    let overrideSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: standardDir.path,
+      environment: [:]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: overrideSelection),
+      .chatTemplate
+    )
+
+    let environmentSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: nil,
+      environment: ["ZIMAGE_ENCODER_PATH": standardDir.path]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: environmentSelection),
+      .chatTemplate
+    )
+  }
+
+  func testPromptEncodingModeUsesPlainForNonDefaultEncoderDirectory() throws {
+    let modelDir = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: modelDir) }
+
+    let standardDir = modelDir.appendingPathComponent("text_encoder")
+    let preferredDir = modelDir.appendingPathComponent("text_encoder QWen Large")
+    let customDir = modelDir.appendingPathComponent("encoder-override")
+
+    try makeDirectory(standardDir)
+    try makeDirectory(preferredDir)
+    try makeDirectory(customDir)
+
+    FileManager.default.createFile(atPath: standardDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+    FileManager.default.createFile(atPath: preferredDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+    FileManager.default.createFile(atPath: customDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+
+    let autoSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: nil,
+      environment: [:]
+    )
+    XCTAssertEqual(autoSelection.source, .autoDetectedPreferred)
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: autoSelection),
+      .plain
+    )
+
+    let overrideSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: customDir.path,
+      environment: [:]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: overrideSelection),
+      .plain
+    )
+  }
+
   func testResolveVAEWeightsSupportsGenericShardNamesAndIndex() throws {
     let modelDir = try makeTempDirectory()
     defer { try? FileManager.default.removeItem(at: modelDir) }
