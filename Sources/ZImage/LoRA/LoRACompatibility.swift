@@ -266,6 +266,105 @@ public enum LoRACompatibility {
     )
   }
 
+  // MARK: - #402: cross-family enforcement guard
+
+  /// Canonical compatibility "family group" for one tag on a LoRA's
+  /// `model_compatibility` list (`LoRALibraryEntry.modelCompatibility`,
+  /// `LoRAScanner.knownCompatibilityTags`). Groups the aliases the scanner
+  /// and library writers use (`klein-9b`/`klein-4b` → one Flux 2 Klein group,
+  /// `krea2`/`krea-2`/`krea-2-turbo` → one group, …) onto ONE token per
+  /// architecture, reusing `familyMapping` for the families it already
+  /// normalizes.
+  ///
+  /// `"flux1"` is its OWN group — the real Flux.1-dev/schnell architecture a
+  /// LoRA's metadata can declare — and is DELIBERATELY NOT folded into
+  /// `"z-image"`, even though this engine's `WarmModelFamily.flux1` case is
+  /// the Z-Image family under an internal name (comfybox#154: the DiT
+  /// `.flux1` boots is Z-Image/Lumina2, not Flux.1; comfybox#393 named this
+  /// exact ambiguity). Conflating the two would let a genuine Flux.1 LoRA
+  /// silently pass this guard for a `WarmModelFamily.flux1` (Z-Image) request
+  /// purely because both happen to spell "flux1" — callers must map
+  /// `WarmModelFamily.flux1` to `"z-image"` explicitly (see
+  /// `WarmModelFamily.loraCompatibilityFamily` in `WarmServer.swift`) rather
+  /// than passing its raw value through here.
+  ///
+  /// `"ltx"` is LTX-2's group (video) — the only video path this engine has
+  /// (`intent.md`). `"unknown"` (a legal declared value,
+  /// `LoRAScanner.knownCompatibilityTags`) and any tag this function does not
+  /// recognize both return nil — "no confident family", never a family of
+  /// their own.
+  public static func familyGroup(forCompatibilityTag tag: String) -> String? {
+    let lower = tag.lowercased()
+    if lower == "flux1" { return "flux1" }
+    if ["ltx", "ltx2", "ltx-2", "ltxv", "ltx-video", "ltx_video"].contains(lower) { return "ltx" }
+    if lower == "unknown" { return nil }
+    if let family = familyMapping(lower) { return canonicalGroup(for: family) }
+    return nil
+  }
+
+  private static func canonicalGroup(for family: ComfyBoxModelFamily) -> String {
+    switch family {
+    case .zImage: return "z-image"
+    case .flux2Klein: return "flux2-klein"
+    case .chroma: return "chroma"
+    case .krea2: return "krea2"
+    case .fibo: return "fibo"
+    case .seedvr2: return "seedvr2"
+    case .esrgan: return "esrgan"
+    }
+  }
+
+  /// Result of the #402 cross-family guard. Distinct from
+  /// `LoRACompatibilityResult` above (the #73 library UI's trial-key-mapping
+  /// estimate, which reads a file) — this is the enforcement decision at
+  /// swap/generate/preset-save time, using ONLY the entry's DECLARED
+  /// `model_compatibility`, never a file read.
+  public struct GuardDecision: Sendable, Equatable {
+    /// Whether the request/swap/preset may proceed.
+    public let allowed: Bool
+    /// Present when `allowed` is true but the answer is not confident
+    /// (no declared tags, or none recognized) — #402 ruling 2: unknown
+    /// compatibility is allowed, with a warning, never a refusal.
+    public let warning: String?
+    /// The LoRA's own recognized family group(s), for the caller's 400
+    /// message. Empty when `warning` is set (nothing confident was found).
+    public let loraFamilies: [String]
+
+    public init(allowed: Bool, warning: String? = nil, loraFamilies: [String] = []) {
+      self.allowed = allowed
+      self.warning = warning
+      self.loraFamilies = loraFamilies
+    }
+  }
+
+  /// #402 — the pure cross-family validator: `LoRACompatibility.check`'s
+  /// counterpart for enforcement rather than the library UI's match-ratio
+  /// estimate. Compares a LoRA's DECLARED `model_compatibility` tags against
+  /// the canonical family group the request/swap/preset targets.
+  ///
+  /// - No recognized tag at all (empty list, every tag unrecognized, or the
+  ///   explicit `"unknown"` value) → `.allowed = true` with a warning. Per
+  ///   the #402 ruling, unknown compatibility is never a refusal.
+  /// - At least one tag resolves to the SAME group as `targetFamily` →
+  ///   allowed, no warning — an entry may legitimately declare more than one
+  ///   compatible family.
+  /// - Every recognized tag resolves to a DIFFERENT, known group → rejected,
+  ///   naming the LoRA's family/families so the caller can build a 400
+  ///   naming both.
+  public static func checkFamily(modelCompatibility: [String], targetFamily: String) -> GuardDecision {
+    let groups = modelCompatibility.compactMap(familyGroup(forCompatibilityTag:))
+    if groups.isEmpty {
+      let detail = modelCompatibility.isEmpty
+        ? "no model_compatibility declared"
+        : "model_compatibility \(modelCompatibility) is not a recognized family"
+      return GuardDecision(allowed: true, warning: "\(detail) — allowing with a warning")
+    }
+    if groups.contains(targetFamily) {
+      return GuardDecision(allowed: true)
+    }
+    return GuardDecision(allowed: false, loraFamilies: Array(Set(groups)).sorted())
+  }
+
   // MARK: - Key Extraction Helpers
 
   /// Extract unique base keys from LoRA tensor names.

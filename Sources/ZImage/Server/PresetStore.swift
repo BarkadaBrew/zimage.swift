@@ -882,8 +882,12 @@ public final class PresetStore: @unchecked Sendable {
   /// Insert `preset`, or replace the existing one with the same id. Validates first; on success
   /// the store is persisted atomically. Returns the (validated) stored preset.
   @discardableResult
-  public func upsert(_ preset: ImagePreset) throws -> ImagePreset {
-    let validated = try PresetStore.validate(preset, log: { [logger] in logger.warning("\($0)") })
+  public func upsert(
+    _ preset: ImagePreset,
+    loraLookup: (String) -> LoRALibraryEntry? = { _ in nil }
+  ) throws -> ImagePreset {
+    let validated = try PresetStore.validate(
+      preset, log: { [logger] in logger.warning("\($0)") }, loraLookup: loraLookup)
     lock.lock(); defer { lock.unlock() }
     if let idx = presets.firstIndex(where: { $0.id == validated.id }) {
       presets[idx] = validated
@@ -1023,7 +1027,10 @@ public final class PresetStore: @unchecked Sendable {
   /// Port of `validatePreset` (service.ts): required non-empty `id`/`name`; when present,
   /// `steps`/`width`/`height` must be positive integers, and every LoRA scale must be finite.
   /// Kept lenient on the string enum fields (like the tolerant decode) — the client owns them.
-  static func validate(_ preset: ImagePreset, log: (String) -> Void = { _ in }) throws -> ImagePreset {
+  static func validate(
+    _ preset: ImagePreset, log: (String) -> Void = { _ in },
+    loraLookup: (String) -> LoRALibraryEntry? = { _ in nil }
+  ) throws -> ImagePreset {
     if preset.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw PresetStoreError.validation(#"required field "id" is missing or empty"#)
     }
@@ -1050,10 +1057,69 @@ public final class PresetStore: @unchecked Sendable {
     }
     try validateRecipeFields(preset)
     try validateKromaPolicy(preset)
+    try validateLoRAFamilyCompatibility(preset, lookup: loraLookup, log: log)
     // Todd 2026-09-04: fold a structured `kroma` declaration into `loras[]`
     // and replace it with the derived, read-only view — see
     // `ImagePreset.migratingKromaDeprecation`.
     return ImagePreset.migratingKromaDeprecation(preset, log: log)
+  }
+
+  // MARK: - #402: cross-family LoRA guard at preset save
+
+  /// The canonical `LoRACompatibility.checkFamily` group this preset
+  /// targets, or nil when it declares none — resolved the SAME way the
+  /// engine already resolves a preset's family elsewhere (comfybox#377/#393):
+  /// `mediaKind` for video (LTX-2 is the only video path, `intent.md`),
+  /// `resolvesToKrea2Family` for krea2 (checkpointFamily OR model spec, same
+  /// as `validateKromaPolicy`'s neighbor), the z-image checkpoint labels, and
+  /// otherwise `model` through the same `SamplingRecipeCatalog.canonicalFamily`
+  /// + `WarmModelFamily` resolution `/v1/generate`'s
+  /// `ImageMemoryPreflight.resolvedFamily` uses. nil (no model, no
+  /// checkpointFamily, no video mediaKind) is a legitimate answer — the #402
+  /// ruling requires it to warn, never refuse.
+  static func resolvedLoRAFamily(for preset: ImagePreset) -> String? {
+    if preset.mediaKind?.lowercased() == "video" { return "ltx" }
+    if resolvesToKrea2Family(preset) { return "krea2" }
+    if let family = preset.checkpointFamily, zimageCheckpointFamilies.contains(family) { return "z-image" }
+    if let model = preset.model, !model.isEmpty,
+       let canonical = SamplingRecipeCatalog.canonicalFamily(model),
+       let warmFamily = WarmModelFamily(rawValue: canonical) {
+      return warmFamily.loraCompatibilityFamily
+    }
+    return nil
+  }
+
+  /// #402 — `POST`/`PUT /v1/presets`: reject a LoRA whose declared
+  /// `model_compatibility` confidently targets a DIFFERENT family than this
+  /// preset resolves to. A preset that resolves to no family at all is never
+  /// refused here (`resolvedLoRAFamily` returning nil) — only logged, since
+  /// there is nothing to compare against.
+  static func validateLoRAFamilyCompatibility(
+    _ preset: ImagePreset,
+    lookup: (String) -> LoRALibraryEntry?,
+    log: (String) -> Void = { _ in }
+  ) throws {
+    guard !preset.loras.isEmpty else { return }
+    guard let targetFamily = resolvedLoRAFamily(for: preset) else {
+      log("preset \"\(preset.id)\": no resolvable model family (mediaKind/checkpointFamily/model) "
+        + "— LoRA family compatibility not enforced")
+      return
+    }
+    for lora in preset.loras {
+      let name = (lora.filename as NSString).lastPathComponent
+      let declared = lookup(lora.filename) ?? lookup(name)
+      let decision = LoRACompatibility.checkFamily(
+        modelCompatibility: declared?.modelCompatibility ?? [], targetFamily: targetFamily)
+      if let warning = decision.warning {
+        log("preset \"\(preset.id)\" loras[\(name)]: \(warning)")
+      }
+      guard decision.allowed else {
+        throw PresetStoreError.validation(
+          "preset \"\(preset.id)\": LoRA \"\(name)\" is compatible with "
+            + "\(decision.loraFamilies.joined(separator: "/")), not \"\(targetFamily)\" "
+            + "— remove it or target a compatible family")
+      }
+    }
   }
 
   // MARK: Checkpoint family + kroma (WP-E20, D7, D14, O4a)
