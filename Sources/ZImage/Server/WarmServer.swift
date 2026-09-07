@@ -5288,11 +5288,35 @@ public final class WarmServer {
     auditLog.append(
       kind: "video.storyboard",
       message: "\(spec.shots.count) shots -> \(resolvedOutput)", metadata: [:])
+
+    // comfybox#401: each per-shot clip already got its own sidecar+atom via
+    // `LTX2VideoGenerator.render` (the storyboard's i2v shots go through the
+    // same `prepareLocalVideo` -> `generate` path every other video route
+    // does). The FINAL assembled clip does not — `MontageComposer` is a
+    // different writer (composition/export, not `LTX2PostProcess.writeMP4`)
+    // — so it gets its own aggregate record here. Sidecar only (ruling 2's
+    // "mandatory" half); no single request's seed/steps/model apply to an
+    // assembly of N independently-seeded shots, so those fields are absent
+    // rather than misleadingly picking one shot's.
+    let storyboardRecord = VideoGenerationRecord(
+      prompt: spec.shots.map(\.prompt).joined(separator: " / "),
+      model: "ltx2-storyboard",
+      width: spec.output.width, height: spec.output.height,
+      frames: montage.frameCount, fps: spec.output.fps,
+      resolvedWidth: spec.output.width, resolvedHeight: spec.output.height,
+      twoPass: false, refine: false, audio: false,
+      kind: "storyboard",
+      loras: spec.loras.map {
+        VideoGenerationRecord.LoRAEntry(name: VideoGenerationRecord.basename($0.path), scale: $0.scale)
+      })
+    VideoSidecar.write(storyboardRecord, forMediaAt: montage.outputPath)
+
     return LTX2VideoResult(
       outputPath: montage.outputPath,
       frameCount: montage.frameCount,
       durationSeconds: Float(montage.durationS),
-      elapsedSeconds: Date().timeIntervalSince(started))
+      elapsedSeconds: Date().timeIntervalSince(started),
+      generationRecord: storyboardRecord)
   }
 
   // MARK: - Montage (#232)
@@ -7610,6 +7634,8 @@ private final class LocalVideoJob: @unchecked Sendable {
   /// comfybox#307: set on success when `two_stage` was requested and the
   /// refine could not run — see `LTX2RefineGate`.
   var refineSkippedReason: String?
+  /// comfybox#401: set on success — see `VideoJobStatus.generationRecord`.
+  var generationRecord: VideoGenerationRecord?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -7637,7 +7663,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       resolvedConfig: resolvedConfig,
       frameCount: frameCount,
       interrupted: interrupted ? true : nil,
-      refineSkipped: refineSkippedReason
+      refineSkipped: refineSkippedReason,
+      generationRecord: generationRecord
     )
   }
 }
@@ -7799,6 +7826,7 @@ final class VideoJobTracker: @unchecked Sendable {
       job.progressPercent = 100
       job.completedAt = Date()
       job.refineSkippedReason = result.refineSkippedReason
+      job.generationRecord = result.generationRecord
     }
     lock.unlock()
     var payload = [

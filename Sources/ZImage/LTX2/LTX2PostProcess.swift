@@ -279,7 +279,26 @@ public enum LTX2PostProcess {
     height: Int,
     bitsPerPixelOverride: Double? = nil,
     audio: AudioTrack? = nil,
-    deliveryShortEdge: Int = 0
+    deliveryShortEdge: Int = 0,
+    /// comfybox#401: the generation record's JSON, embedded as a metadata
+    /// atom alongside the mandatory `.json` sidecar (ruling 2 — "atom
+    /// optional"). `nil` (the default) touches NOTHING below — no atom is
+    /// requested, so this parameter changes zero bytes of the written file
+    /// relative to a caller that never passed it (see
+    /// `LTX2PostProcessMetadataTests` for the byte-identity regression this
+    /// guards).
+    ///
+    /// Carried in the container's standard "common" description field
+    /// (`AVMetadataKeySpace.common` / `commonKeyDescription`) rather than a
+    /// custom reverse-DNS key: AVAssetWriter's QuickTime-style keyed metadata
+    /// (`.quickTimeMetadata`, `mdta` identifiers) and QuickTime userdata
+    /// comment atoms are both silently DROPPED for `fileType: .mp4` — verified
+    /// empirically (they write fine for `.mov`, add zero bytes for `.mp4`).
+    /// `.common`/`commonKeyDescription` is the one keyspace AVAssetWriter
+    /// actually persists into an ISO-brand `.mp4`, and it's a plain header
+    /// field write — no video re-encode, same as the PNG side embedding its
+    /// full JSON record in EXIF `UserComment` rather than a bespoke tag.
+    generationRecordJSON: String? = nil
   ) throws {
     guard !frames.isEmpty else {
       throw LTX2PostProcessError.noFrames
@@ -292,6 +311,13 @@ public enum LTX2PostProcess {
 
     // Create asset writer
     let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+    if let generationRecordJSON {
+      let item = AVMutableMetadataItem()
+      item.keySpace = .common
+      item.key = AVMetadataKey.commonKeyDescription as NSString
+      item.value = generationRecordJSON as NSString
+      writer.metadata = [item]
+    }
 
     // Video settings. Bitrate: 0.5 bits/pixel (~12 Mbps @ 768x1280x24) is
     // visually equivalent to the old 4 bits/px for generated content but ~8x

@@ -20,6 +20,40 @@ Local LTX-2 body (snake_case): `{prompt, negative_prompt?, image_path?, width?, 
 `image_path` present = image-to-video; absent = text-to-video. Output is
 contained to the server's allowed output directory.
 
+### Generation record — MP4 parity with the PNG XMP record (comfybox#401)
+
+Every local LTX-2 output (t2v, i2v, extend, `/v1/video/rerender`, and each
+per-shot clip AND the final assembled clip of a `/v1/storyboard/render`) gets
+the same provenance record the PNG side embeds in EXIF `UserComment`:
+`prompt`, `negative_prompt`, `seed`, `steps`, `model`, `width`/`height`
+(requested budget), `frames`, `fps`, `resolved_width`/`resolved_height`
+(actual encoded size — differs from the budget when two-stage refine ran),
+`dimension_reason` (currently always `null` — populated once
+`VideoDimensionResolver`, #405/#408, lands), `two_pass`/`refine`
+(`refine` is `false` when `two_pass` was requested but skipped — see
+`refine_skipped_reason`), `audio`, `kind` (`t2v`\|`i2v`\|`extend`\|`storyboard`),
+and `loras[]` (`{name, scale}`).
+
+Two sinks, one mandatory:
+
+1. **`.json` sidecar** next to the output file — `<basename>.json`, same
+   directory, same convention the desktop editor's image sidecars and the
+   DAM ingestor's video reader already use (`EditSidecar.sidecarPath`,
+   `AssetIngestor.readSidecar`). Always written; a write failure never fails
+   the render (the clip is the primary artifact — logged, not thrown).
+2. **MP4 metadata atom** (best-effort, header-only, no re-encode) — the
+   record's JSON in the container's standard "common description" field
+   (`AVMetadataKeySpace.common` / `commonKeyDescription`; readable via
+   `AVAsset.metadata` or `exiftool`'s `Description` tag). AVAssetWriter's
+   QuickTime-style keyed (`mdta`) metadata and userdata comment atoms are
+   both silently dropped for `fileType: .mp4` — verified empirically — so
+   this is the one keyspace that actually persists into an ISO-brand `.mp4`.
+
+`GET /v1/video/status/{id}` carries the same record as the additive
+`generation_record` field once the render succeeds (local LTX-2 backend
+only; `null` while queued/processing, on failure, and on the Replicate cloud
+path).
+
 ## Prompt enhancement
 
 `POST /v1/enhance` body: `{prompt, character?, character_description?, content_mode?}`

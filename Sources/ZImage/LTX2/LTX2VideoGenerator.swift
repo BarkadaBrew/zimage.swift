@@ -161,16 +161,23 @@ public struct LTX2VideoResult: Sendable {
     /// was requested for this render — nil when it ran, wasn't requested, or
     /// (montage/storyboard assembly) doesn't apply. See `LTX2RefineGate`.
     public let refineSkippedReason: String?
+    /// comfybox#401: the record written to the sidecar (and, when encodable,
+    /// the mp4 atom) for this render. `nil` for the montage/storyboard
+    /// assembly result (`WarmServer.runStoryboard`), which composes
+    /// already-recorded per-shot clips via a different writer and gets its
+    /// own aggregate sidecar there — not this struct.
+    public let generationRecord: VideoGenerationRecord?
 
     public init(
         outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
-        refineSkippedReason: String? = nil
+        refineSkippedReason: String? = nil, generationRecord: VideoGenerationRecord? = nil
     ) {
         self.outputPath = outputPath
         self.frameCount = frameCount
         self.durationSeconds = durationSeconds
         self.elapsedSeconds = elapsedSeconds
         self.refineSkippedReason = refineSkippedReason
+        self.generationRecord = generationRecord
     }
 }
 
@@ -1731,6 +1738,27 @@ public final class LTX2VideoGenerator {
             }
         }
 
+        // comfybox#401: the generation record — same schema as the PNG side's
+        // EXIF `UserComment` JSON (see VideoGenerationRecord.swift). Built
+        // BEFORE `writeMP4` so it can also ride as the mp4's own metadata
+        // atom; the sidecar (mandatory) is written AFTER the mp4, so a render
+        // that fails mid-write never leaves an orphaned sidecar next to a
+        // file that doesn't exist. `deliveryDims` is what `writeMP4` actually
+        // encodes — using `outW`/`outH` here would record the pre-delivery-
+        // scale size on a downscaled delivery.
+        let (deliveredW, deliveredH) = LTX2PostProcess.deliveryDims(
+            width: outW, height: outH, shortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        let generationRecord = VideoGenerationRecord.build(
+            request: request,
+            transformerFile: config.transformerFile,
+            frameCount: allFrames.count,
+            resolvedWidth: deliveredW,
+            resolvedHeight: deliveredH,
+            twoStageRequested: pipeline.resolvedConfig.twoStage,
+            refineSkippedReason: refineSkippedReason,
+            audioWritten: audioTrack != nil)
+        let generationRecordJSON = try? generationRecord.encodeJSON()
+
         // comfybox#322: last boundary before anything is written to disk, so a
         // cancelled render never leaves a file at `outputPath` (the `defer`
         // above is the backstop for a cancel that lands mid-write).
@@ -1742,9 +1770,15 @@ public final class LTX2VideoGenerator {
             fps: request.fps, width: outW, height: outH,
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
             audio: audioTrack,
-            deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+            deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge,
+            generationRecordJSON: generationRecordJSON.flatMap { String(data: $0, encoding: .utf8) })
         wroteOutput = true
         telemetry?.end(.postProcess)
+
+        // comfybox#401 ruling 2: the sidecar is MANDATORY — best-effort (never
+        // fails a render that produced a real clip); `VideoSidecar.write`
+        // logs its own failure.
+        VideoSidecar.write(generationRecord, forMediaAt: request.outputPath)
 
         return .completed(LTX2VideoResult(
             outputPath: request.outputPath,
@@ -1758,7 +1792,8 @@ public final class LTX2VideoGenerator {
             // `pipeline.lastRefineSkipReason`, which only ever reflects THIS
             // invocation and would drop an earlier chunk's reason if a
             // preemption rebuilt the pipeline in between.
-            refineSkippedReason: refineSkippedReason
+            refineSkippedReason: refineSkippedReason,
+            generationRecord: generationRecord
         ))
         #else
         throw LTX2VideoError.unsupportedPlatform
