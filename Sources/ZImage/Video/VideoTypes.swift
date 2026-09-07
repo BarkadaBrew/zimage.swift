@@ -244,6 +244,13 @@ public struct VideoJobStatus: Codable, Sendable {
   /// render and the refine pass could not run (upsampler unavailable, or the
   /// volume gate) — see `LTX2RefineGate`. nil on the cloud path.
   public let refineSkipped: String?
+  /// comfybox#401: the same record written to the `.json` sidecar next to
+  /// the output file (and, when encodable, the mp4's own metadata atom) —
+  /// so a poller of `GET /v1/video/status/{id}` gets the full generation
+  /// record without a second read of the filesystem. Set on success for the
+  /// local LTX-2 backend; nil while queued/processing, on failure, and on
+  /// the Replicate cloud path (no local render to record).
+  public let generationRecord: VideoGenerationRecord?
 
   public init(
     jobId: String,
@@ -263,7 +270,8 @@ public struct VideoJobStatus: Codable, Sendable {
     resolvedConfig: [LTX2ResolvedParam]? = nil,
     frameCount: Int? = nil,
     interrupted: Bool? = nil,
-    refineSkipped: String? = nil
+    refineSkipped: String? = nil,
+    generationRecord: VideoGenerationRecord? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -283,5 +291,6 @@ public struct VideoJobStatus: Codable, Sendable {
     self.frameCount = frameCount
     self.interrupted = interrupted
     self.refineSkipped = refineSkipped
+    self.generationRecord = generationRecord
   }
 }
